@@ -194,6 +194,63 @@ enum ChromaSampling {
         return result
     }
 
+    /// Reconstructs full-resolution integer JPEG components at their sample centers.
+    ///
+    /// Sampling ratios come from SOF, not rounded plane dimensions: an odd-width
+    /// 2:1 component still has a factor of two. The usual 2:1 cases use the
+    /// centered triangle filter and alternating rounding biases of libjpeg's
+    /// h2v1/h1v2/h2v2 fancy upsamplers (jdsample.c). Very narrow horizontal
+    /// components use replication, as libjpeg does. Round IDCT samples before
+    /// filtering, then round the combined filter once before color conversion.
+    /// This is separate from the floating-point/preview resizer above.
+    static func upsampleJPEG(_ plane: [Float], width: Int, height: Int,
+                             targetWidth: Int, targetHeight: Int,
+                             horizontalSampling: Int, verticalSampling: Int,
+                             maximumHorizontalSampling: Int,
+                             maximumVerticalSampling: Int) -> [Float] {
+        let h1 = horizontalSampling == maximumHorizontalSampling
+        let v1 = verticalSampling == maximumVerticalSampling
+        let h2 = horizontalSampling * 2 == maximumHorizontalSampling
+        let v2 = verticalSampling * 2 == maximumVerticalSampling
+        // Other sampling geometries retain the existing resampling behavior.
+        guard (h1 || h2) && (v1 || v2) else {
+            return upsample(plane, width: width, height: height,
+                            targetWidth: targetWidth, targetHeight: targetHeight)
+        }
+        let samples = plane.map { $0.rounded() }
+        if h1 && v1 { return samples }
+        let fancy = !h2 || width > 2
+        return samples.withUnsafeBufferPointer { input in
+            [Float](unsafeUninitializedCapacity: targetWidth * targetHeight) { output, count in
+                for y in 0..<targetHeight {
+                    let cy = min(v2 ? y / 2 : y, height - 1)
+                    let ny = min(max(cy + (y.isMultiple(of: 2) ? -1 : 1), 0), height - 1)
+                    for x in 0..<targetWidth {
+                        let cx = min(h2 ? x / 2 : x, width - 1)
+                        let nx = min(max(cx + (x.isMultiple(of: 2) ? -1 : 1), 0), width - 1)
+                        let current = Int(input[cy * width + cx])
+                        let value: Int
+                        if !fancy {
+                            value = current
+                        } else if h2 && v2 {
+                            let near = 3 * current + Int(input[ny * width + cx])
+                            let far = 3 * Int(input[cy * width + nx]) + Int(input[ny * width + nx])
+                            value = (3 * near + far + (x.isMultiple(of: 2) ? 8 : 7)) >> 4
+                        } else if h2 {
+                            value = (3 * current + Int(input[cy * width + nx])
+                                     + (x.isMultiple(of: 2) ? 1 : 2)) >> 2
+                        } else {
+                            value = (3 * current + Int(input[ny * width + cx])
+                                     + (y.isMultiple(of: 2) ? 1 : 2)) >> 2
+                        }
+                        output[y * targetWidth + x] = Float(value)
+                    }
+                }
+                count = targetWidth * targetHeight
+            }
+        }
+    }
+
     /// Returns the horizontal and vertical sampling factors for a subsampling mode.
     static func samplingFactors(for mode: JLIChromaSubsampling) -> (h: Int, v: Int) {
         switch mode {
