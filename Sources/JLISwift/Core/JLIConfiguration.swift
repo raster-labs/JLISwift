@@ -288,8 +288,13 @@ public struct JLIDecoderConfiguration: Sendable {
 
     /// The desired output color model.
     ///
-    /// When `nil`, the decoder outputs in the JPEG's native color model (typically RGB).
+    /// DCT decoding returns grayscale or RGB. A different requested model is refused
+    /// rather than relabeling converted bytes. Lossless decoding preserves components.
     public var outputColorModel: JLIColorModel?
+
+    /// Optional source interpretation for three-component DCT JPEG without a color marker.
+    /// Only RGB and YCbCr are supported; this controls conversion rather than relabeling output.
+    public var sourceColorModel: JLIColorModel?
 
     /// Decode at a reduced scale of `1/scale` for fast previews/thumbnails of
     /// large images. Supported: `1` (full, default), `2`, `4`, and `8`. Each
@@ -299,6 +304,13 @@ public struct JLIDecoderConfiguration: Sendable {
     /// `8` is the DC-only special case. Output dimensions are
     /// `ceil(width/scale) × ceil(height/scale)`.
     public var scale: Int
+
+    /// Maximum input size, checked before marker parsing (default 64 MiB).
+    public var maximumEncodedBytes: Int
+    /// Maximum full-resolution source pixels, checked before sample allocation.
+    public var maximumPixels: Int
+    /// Maximum unpacked output bytes, checked before sample allocation.
+    public var maximumDecodedBytes: Int
 
     /// A sensible default configuration that auto-detects precision and color model.
     public static let `default` = JLIDecoderConfiguration(
@@ -315,10 +327,18 @@ public struct JLIDecoderConfiguration: Sendable {
     public init(
         outputPixelFormat: JLIPixelFormat? = nil,
         outputColorModel: JLIColorModel? = nil,
-        scale: Int = 1
+        scale: Int = 1,
+        sourceColorModel: JLIColorModel? = nil,
+        maximumEncodedBytes: Int = 64 << 20,
+        maximumPixels: Int = 16 << 20,
+        maximumDecodedBytes: Int = 64 << 20
     ) {
         self.outputPixelFormat = outputPixelFormat
         self.outputColorModel = outputColorModel
+        self.sourceColorModel = sourceColorModel
         self.scale = scale
+        self.maximumEncodedBytes = maximumEncodedBytes
+        self.maximumPixels = maximumPixels
+        self.maximumDecodedBytes = maximumDecodedBytes
     }
 }
