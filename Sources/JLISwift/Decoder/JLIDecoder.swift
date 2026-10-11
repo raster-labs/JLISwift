@@ -529,19 +529,26 @@ public struct JLIDecoder: Sendable {
             }
             let yPlane = componentPlanes[0]
 
-            // Upsample Cb and Cr to full resolution
-            let cbUp = ChromaSampling.upsample(
-                componentPlanes[1].data,
-                width: componentPlanes[1].width,
-                height: componentPlanes[1].height,
-                targetWidth: outW, targetHeight: outH
-            )
-            let crUp = ChromaSampling.upsample(
-                componentPlanes[2].data,
-                width: componentPlanes[2].width,
-                height: componentPlanes[2].height,
-                targetWidth: outW, targetHeight: outH
-            )
+            // Full-resolution integer output reconstructs centered JPEG chroma
+            // using SOF sampling factors. Reduced-scale box-average previews
+            // retain their existing floating-point reconstruction.
+            func upsampleChroma(_ index: Int) -> [Float] {
+                let plane = componentPlanes[index]
+                if scale == 1 {
+                    return ChromaSampling.upsampleJPEG(
+                        plane.data, width: plane.width, height: plane.height,
+                        targetWidth: outW, targetHeight: outH,
+                        horizontalSampling: components[index].horizontalSampling,
+                        verticalSampling: components[index].verticalSampling,
+                        maximumHorizontalSampling: hMaxSampling,
+                        maximumVerticalSampling: vMaxSampling)
+                }
+                return ChromaSampling.upsample(
+                    plane.data, width: plane.width, height: plane.height,
+                    targetWidth: outW, targetHeight: outH)
+            }
+            let cbUp = upsampleChroma(1)
+            let crUp = upsampleChroma(2)
 
             // Trim Y plane if padded
             let yTrimmed: [Float]
@@ -549,12 +556,13 @@ public struct JLIDecoder: Sendable {
                 var trimmed = [Float](repeating: 0, count: outW * outH)
                 for y in 0..<outH {
                     for x in 0..<outW {
-                        trimmed[y * outW + x] = yPlane.data[y * yPlane.width + x]
+                        let sample = yPlane.data[y * yPlane.width + x]
+                        trimmed[y * outW + x] = scale == 1 ? sample.rounded() : sample
                     }
                 }
                 yTrimmed = trimmed
             } else {
-                yTrimmed = yPlane.data
+                yTrimmed = scale == 1 ? yPlane.data.map { $0.rounded() } : yPlane.data
             }
 
             if isExtendedPrecision {
