@@ -59,10 +59,33 @@ public struct JLIDecoder: Sendable {
             throw JLIError.invalidJPEGData
         }
 
+        guard data.count <= configuration.maximumEncodedBytes else {
+            throw JLIError.decodingFailed("JPEG exceeds encoded byte limit")
+        }
+
         // Step 1: Parse JPEG markers
         var markerReader = MarkerReader(data: data)
         let parsed = try markerReader.parse()
         let frame = parsed.frameInfo
+        let (pixels, pixelOverflow) = frame.width.multipliedReportingOverflow(by: frame.height)
+        let (samples, sampleOverflow) = pixels.multipliedReportingOverflow(by: frame.components.count)
+        let bytesPerSample = configuration.outputPixelFormat == .float32 ? 4 : (frame.precision > 8 ? 2 : 1)
+        let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: bytesPerSample)
+        guard frame.width > 0, frame.height > 0, !pixelOverflow, !sampleOverflow, !byteOverflow,
+              pixels <= configuration.maximumPixels, bytes <= configuration.maximumDecodedBytes else {
+            throw JLIError.decodingFailed("JPEG exceeds decoded pixel/byte limit")
+        }
+        if let source = configuration.sourceColorModel,
+           source != .rgb && source != .yCbCr {
+            throw JLIError.unsupportedJPEGFeature("Unsupported JPEG source color interpretation")
+        }
+        // A requested color model must describe real output, not merely relabel it.
+        if !frame.isLossless, let requested = configuration.outputColorModel {
+            let actual: JLIColorModel = frame.components.count == 1 ? .grayscale : .rgb
+            guard requested == actual else {
+                throw JLIError.unsupportedJPEGFeature("Requested color conversion is not implemented")
+            }
+        }
 
         guard !parsed.scans.isEmpty else {
             throw JLIError.decodingFailed("No scan data found in JPEG")
@@ -437,6 +460,33 @@ public struct JLIDecoder: Sendable {
                 outputData = plane.data.map { UInt8(clamping: Int($0.rounded())) }
             }
             outputColorModel = configuration.outputColorModel ?? .grayscale
+        } else if numComponents == 3 && parsed.iccProfile != XYBICCProfile.data
+                    && (configuration.sourceColorModel == .rgb
+                    || (configuration.sourceColorModel == nil && (parsed.adobeTransform == 0
+                        || components.map(\.id) == [82, 71, 66]))) {
+            let planes = componentPlanes.map { plane in
+                ChromaSampling.upsample(plane.data, width: plane.width, height: plane.height,
+                                        targetWidth: outW, targetHeight: outH)
+            }
+            if wantsFloat32 {
+                var values = [Float](repeating: 0, count: outW * outH * 3)
+                for i in 0..<(outW * outH) {
+                    for c in 0..<3 { values[i * 3 + c] = planes[c][i] }
+                }
+                outputData = Self.floatsToLE(values)
+            } else {
+                var bytes: [UInt8] = []
+                bytes.reserveCapacity(outW * outH * 3 * (isExtendedPrecision ? 2 : 1))
+                for i in 0..<(outW * outH) {
+                    for c in 0..<3 {
+                        let value = UInt16(clamping: Int(planes[c][i].rounded()))
+                        if isExtendedPrecision { bytes.append(UInt8(value & 255)); bytes.append(UInt8(value >> 8)) }
+                        else { bytes.append(UInt8(clamping: value)) }
+                    }
+                }
+                outputData = bytes
+            }
+            outputColorModel = .rgb
         } else if numComponents == 3 && !isExtendedPrecision
                     && parsed.iccProfile == XYBICCProfile.data {
             // XYB color: the three full-resolution planes are scaled-XYB samples
@@ -579,7 +629,10 @@ public struct JLIDecoder: Sendable {
         for c in frame.components where c.horizontalSampling != 1 || c.verticalSampling != 1 {
             throw JLIError.unsupportedJPEGFeature("subsampled lossless")
         }
-        guard let scan = scans.first else { throw JLIError.decodingFailed("no lossless scan") }
+        guard scans.count == 1, let scan = scans.first,
+              scan.header.components.count == nc else {
+            throw JLIError.unsupportedJPEGFeature("Noninterleaved lossless JPEG scans")
+        }
         let predictor = scan.header.spectralStart       // 1–7
         let pt = scan.header.successiveApproxLow         // point transform
         guard (1...7).contains(predictor) else {
