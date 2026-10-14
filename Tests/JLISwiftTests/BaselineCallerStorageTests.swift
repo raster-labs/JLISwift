@@ -36,7 +36,7 @@ struct BaselineCallerStorageTests {
             #expect(a.load(fromByteOffset: index, as: UInt8.self) == 0xAB)
             #expect(b.load(fromByteOffset: index, as: UInt8.self) == 0xCD)
         }
-        for offset in (16 + 7072)..<(size + 32) {
+        for offset in (16 + 12288)..<(size + 32) {
             #expect(a.load(fromByteOffset: offset, as: UInt8.self) == 0xAB)
             #expect(b.load(fromByteOffset: offset, as: UInt8.self) == 0xCD)
         }
@@ -72,7 +72,11 @@ struct BaselineCallerStorageTests {
           arguments: [1, 2, 3, 7, 8, 9, 17, 33, 65])
     func imageParity(width: Int) throws {
         for height in [1, 3, 9, 19] {
-            let bytes = (0..<(width * height * 3)).map { UInt8(($0 * 39 + $0 / 7) & 255) }
+            let sampleCount = width * height * 3
+            let bytes = (0..<sampleCount).map { (index: Int) -> UInt8 in
+                let mixed = index * 39 + index / 7
+                return UInt8(mixed & 255)
+            }
             let image = try JLIImage(width: width, height: height, pixelFormat: .uint8, colorModel: .rgb, data: bytes)
             for sampling in [JLIChromaSubsampling.yuv444, .yuv422, .yuv420] {
                 for restart in [0, 1, 3] {

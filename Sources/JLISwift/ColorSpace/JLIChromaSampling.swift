@@ -266,10 +266,13 @@ enum ChromaSampling {
     /// Expands a raw component backwards into its reserved full-resolution slot.
     /// Copy both needed source rows before writing a destination row, retaining
     /// still-needed originals across row overlap. Three row slots bound scratch.
-    static func upsampleInPlace(_ plane: UnsafeMutableBufferPointer<Float>, width: Int, height: Int,
+    static func upsampleInPlace(_ plane: UnsafeMutableBufferPointer<Float>, width: Int, height: Int, targetWidth: Int, targetHeight: Int, horizontalSampling: Int, verticalSampling: Int, maximumHorizontalSampling: Int, maximumVerticalSampling: Int, centered: Bool, rowScratch: UnsafeMutableBufferPointer<Float>) throws {
+        try jliCompatibility { upsampleInPlaceCore(plane, width: width, height: height, targetWidth: targetWidth, targetHeight: targetHeight, horizontalSampling: horizontalSampling, verticalSampling: verticalSampling, maximumHorizontalSampling: maximumHorizontalSampling, maximumVerticalSampling: maximumVerticalSampling, centered: centered, rowScratch: rowScratch, cancellation: .task) }
+    }
+    static func upsampleInPlaceCore(_ plane: UnsafeMutableBufferPointer<Float>, width: Int, height: Int,
         targetWidth: Int, targetHeight: Int, horizontalSampling: Int, verticalSampling: Int,
         maximumHorizontalSampling: Int, maximumVerticalSampling: Int, centered: Bool,
-        rowScratch: UnsafeMutableBufferPointer<Float>) throws {
+        rowScratch: UnsafeMutableBufferPointer<Float>, cancellation: JLICancellation = .never) -> JLICoreOutcome<Void> {
         precondition(plane.count >= targetWidth * targetHeight && rowScratch.count >= 3 * width)
         let h1 = horizontalSampling == maximumHorizontalSampling
         let v1 = verticalSampling == maximumVerticalSampling
@@ -284,7 +287,7 @@ enum ChromaSampling {
             return nil
         }
         for y in stride(from: targetHeight - 1, through: 0, by: -1) {
-            try Task.checkCancellation()
+            if case .failure(let failure) = cancellation.check() { return .failure(failure) }
             let srcY = Float(y) * yScale
             let row0: Int, row1: Int
             if jpeg {
@@ -321,6 +324,7 @@ enum ChromaSampling {
                 plane[y * targetWidth + x] = value
             }
         }
+        return .success(())
     }
 
     /// Returns the horizontal and vertical sampling factors for a subsampling mode.

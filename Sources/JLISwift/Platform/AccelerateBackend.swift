@@ -271,7 +271,6 @@ enum AccelerateDSP {
         blockCount n: Int, tables: ReconstructionTables
     ) {
         guard n > 0 else { return }
-        let eightN = vDSP_Length(8 * n)
         let rowStride = 8 * n
 
         // Fused pack: M[r·8N + 8i + c] = dequant(zigzag coefficient at natural
@@ -290,7 +289,16 @@ enum AccelerateDSP {
         }
 
         // Pass 1: T = Cᵀ · M (8 × 8N).
-        vDSP_mmul(tables.transposedDCT, 1, scratch, 1, output, 1, 8, eightN, 8)
+        for row in 0..<8 {
+            for block in 0..<n {
+                var sum = SIMD8<Float>(repeating: 0)
+                for k in 0..<8 {
+                    let source = load8(scratch + k * rowStride + block * 8)
+                    sum = sum.addingProduct(SIMD8(repeating: tables.transposedDCT[row * 8 + k]), source)
+                }
+                store8(sum, to: output + row * rowStride + block * 8)
+            }
+        }
 
         // Rearrange T → V (8N × 8 per-block-contig).
         for i in 0..<n {
@@ -302,7 +310,23 @@ enum AccelerateDSP {
         }
 
         // Pass 2: f = V · C (8N × 8). Output per-block-contig.
-        vDSP_mmul(scratch, 1, tables.dct, 1, output, 1, eightN, 8, 8)
+        for row in 0..<(8 * n) {
+            var sum = SIMD8<Float>(repeating: 0)
+            for k in 0..<8 {
+                sum = sum.addingProduct(SIMD8(repeating: scratch[row * 8 + k]), load8(tables.dct + k * 8))
+            }
+            store8(sum, to: output + row * 8)
+        }
+    }
+
+    /// Explicit lane access accepts Float-aligned storage; no SIMD alignment or
+    /// allocation is imposed on the caller's existing workspace partitions.
+    @inline(__always) private static func load8(_ p: UnsafePointer<Float>) -> SIMD8<Float> {
+        SIMD8(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7])
+    }
+    @inline(__always) private static func store8(_ value: SIMD8<Float>, to p: UnsafeMutablePointer<Float>) {
+        p[0] = value[0]; p[1] = value[1]; p[2] = value[2]; p[3] = value[3]
+        p[4] = value[4]; p[5] = value[5]; p[6] = value[6]; p[7] = value[7]
     }
 
     // MARK: - Image-level color conversion (BT.601)
@@ -419,34 +443,27 @@ enum AccelerateDSP {
     }
 
     /// Canonical conversion with supplied five-Float/three-byte-plane scratch.
-    /// Supports tiled conversion with identical operation order and rounding.
+    /// The fixed scalar operations and direct pack have no external DSP workspace.
     static func imageYCbCrToRGB(y yb: UnsafePointer<Float>, cb cbb: UnsafePointer<Float>,
         cr crb: UnsafePointer<Float>, pixelCount: Int, scratch: UnsafeMutablePointer<Float>,
         planes: UnsafeMutablePointer<UInt8>, output: UnsafeMutableRawPointer) {
-        let n = vDSP_Length(pixelCount)
         let cbS = scratch, crS = scratch + pixelCount, r = scratch + pixelCount * 2
         let g = scratch + pixelCount * 3, b = scratch + pixelCount * 4
-        var neg128: Float = -128.0
-        var rCr: Float = 1.402, gCb: Float = -0.344136, gCr: Float = -0.714136, bCb: Float = 1.772
-        var lo: Float = 0.0, hi: Float = 255.0
-                    vDSP_vsadd(cbb, 1, &neg128, cbS, 1, n)
-                    vDSP_vsadd(crb, 1, &neg128, crS, 1, n)
-                    // R = Y + 1.402 Cr',  G = Y - 0.344136 Cb' - 0.714136 Cr',  B = Y + 1.772 Cb'
-                    vDSP_vsma(crS, 1, &rCr, yb, 1, r, 1, n)
-                    vDSP_vsmul(cbS, 1, &gCb, g, 1, n)
-                    vDSP_vsma(crS, 1, &gCr, g, 1, g, 1, n)
-                    vDSP_vadd(yb, 1, g, 1, g, 1, n)
-                    vDSP_vsma(cbS, 1, &bCb, yb, 1, b, 1, n)
-                    vDSP_vclip(r, 1, &lo, &hi, r, 1, n)
-                    vDSP_vclip(g, 1, &lo, &hi, g, 1, n)
-                    vDSP_vclip(b, 1, &lo, &hi, b, 1, n)
+        for i in 0..<pixelCount { cbS[i] = cbb[i] - 128; crS[i] = crb[i] - 128 }
+        for i in 0..<pixelCount {
+            r[i] = yb[i].addingProduct(1.402, crS[i])
+            let green = cbS[i] * -0.344136
+            g[i] = green.addingProduct(-0.714136, crS[i]) + yb[i]
+            b[i] = yb[i].addingProduct(1.772, cbS[i])
+        }
         let pr = planes, pg = pr + pixelCount, pb = pr + pixelCount * 2
-        vDSP_vfixru8(r, 1, pr, 1, n); vDSP_vfixru8(g, 1, pg, 1, n); vDSP_vfixru8(b, 1, pb, 1, n)
-        var sR = vImage_Buffer(data: pr, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-        var sG = vImage_Buffer(data: pg, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-        var sB = vImage_Buffer(data: pb, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-        var dst = vImage_Buffer(data: output, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount * 3)
-        vImageConvert_Planar8toRGB888(&sR, &sG, &sB, &dst, vImage_Flags(kvImageNoFlags))
+        for i in 0..<pixelCount {
+            pr[i] = UInt8(min(max(r[i], 0), 255).rounded(.toNearestOrEven))
+            pg[i] = UInt8(min(max(g[i], 0), 255).rounded(.toNearestOrEven))
+            pb[i] = UInt8(min(max(b[i], 0), 255).rounded(.toNearestOrEven))
+        }
+        let dst = output.assumingMemoryBound(to: UInt8.self)
+        for i in 0..<pixelCount { dst[i * 3] = pr[i]; dst[i * 3 + 1] = pg[i]; dst[i * 3 + 2] = pb[i] }
     }
 
     // MARK: - 16-bit (12-bit precision) color conversion

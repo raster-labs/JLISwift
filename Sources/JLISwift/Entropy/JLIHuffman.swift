@@ -301,29 +301,35 @@ enum HuffmanEncoder {
 
 /// Huffman entropy decoder for JPEG data.
 enum HuffmanDecoder {
+    static func decodeSymbol<T: HuffmanDecodeTable>(from reader: inout BitReader, table: T) throws -> UInt8 { try jliCompatibility { decodeSymbolCore(from: &reader, table: table) } }
+    static func decodeSymbolBitByBit<T: HuffmanDecodeTable>(from reader: inout BitReader, table: T) throws -> UInt8 { try jliCompatibility { decodeSymbolBitByBitCore(from: &reader, table: table) } }
+    static func decodeValue(from reader: inout BitReader, category: Int) throws -> Int32 { try jliCompatibility { decodeValueCore(from: &reader, category: category) } }
+    static func decodeDC<T: HuffmanDecodeTable>(from reader: inout BitReader, table: T) throws -> Int32 { try jliCompatibility { decodeDCCore(from: &reader, table: table) } }
+    static func decodeAC<T: HuffmanDecodeTable>(from reader: inout BitReader, table: T, into out: UnsafeMutableBufferPointer<Int32>) throws { try jliCompatibility { decodeACCore(from: &reader, table: table, into: out) } }
 
     /// Decodes a single Huffman symbol from the bit stream.
-    static func decodeSymbol<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) throws -> UInt8 {
+    static func decodeSymbolCore<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) -> JLICoreOutcome<UInt8> {
         // Fast path: resolve short (≤8-bit) codes from an 8-bit lookahead table.
         // Falls through to the bit-by-bit walk for long codes and any byte near
         // a marker / end of data, so all error and restart handling is unchanged.
-        if let symbol = reader.fastDecodeSymbol(table) { return symbol }
-        return try decodeSymbolBitByBit(from: &reader, table: table)
+        if let symbol = reader.fastDecodeSymbol(table) { return .success(symbol) }
+        return decodeSymbolBitByBitCore(from: &reader, table: table)
     }
 
     /// Bit-by-bit Huffman symbol decode: reads one bit at a time, comparing the
     /// accumulated code against `maxCode` at each length (ITU-T T.81 F.2.2.3).
     /// This is the reference/fallback path — it owns all long-code (>8-bit),
-    /// marker, EOF, and malformed-table handling. ``decodeSymbol(from:table:)``
+    /// marker, EOF, and malformed-table handling. ``decodeSymbolCore(from:table:)``
     /// only short-circuits to the lookahead table when it can prove the result
     /// is identical to this walk.
-    static func decodeSymbolBitByBit<Table: HuffmanDecodeTable>(
+    static func decodeSymbolBitByBitCore<Table: HuffmanDecodeTable>(
         from reader: inout BitReader, table: Table
-    ) throws -> UInt8 {
+    ) -> JLICoreOutcome<UInt8> {
         var code: Int32 = 0
 
         for bitLength in 1...16 {
-            let bit = try reader.readBit()
+            let coreOutcome1 = reader.readBitCore()
+            guard case .success(let bit) = coreOutcome1 else { return .failure(coreOutcome1.failureValue) }
             code = (code << 1) | Int32(bit)
 
             if table.maxCode[bitLength] >= 0 && code <= table.maxCode[bitLength] {
@@ -332,33 +338,36 @@ enum HuffmanDecoder {
                 // valPtr/minCode that points past the value list; bounds-check
                 // rather than trap on untrusted input.
                 guard index >= 0, index < table.values.count else {
-                    throw JLIError.decodingFailed("Huffman code index out of range")
+                    return .failure(JLICoreFailure(code: 130, kind: .decoding))
                 }
-                return table.values[index]
+                return .success(table.values[index])
             }
         }
 
-        throw JLIError.decodingFailed("Invalid Huffman code")
+        return .failure(JLICoreFailure(code: 131, kind: .decoding))
     }
 
     /// Decodes a signed value from additional bits after a Huffman category.
-    static func decodeValue(from reader: inout BitReader, category cat: Int) throws -> Int32 {
-        guard cat > 0 else { return 0 }
-        guard cat <= 16 else { throw JLIError.decodingFailed("Invalid Huffman value category") }
+    static func decodeValueCore(from reader: inout BitReader, category cat: Int) -> JLICoreOutcome<Int32> {
+        guard cat > 0 else { return .success(0) }
+        guard cat <= 16 else { return .failure(JLICoreFailure(code: 132, kind: .decoding)) }
 
-        let bits = try reader.readBits(cat)
+        let coreOutcome1 = reader.readBitsCore(cat)
+        guard case .success(let bits) = coreOutcome1 else { return .failure(coreOutcome1.failureValue) }
         // If MSB is 0, the value is negative
         if bits < (1 << (cat - 1)) {
-            return Int32(bits) - Int32((1 << cat) - 1)
+            return .success(Int32(bits) - Int32((1 << cat) - 1))
         } else {
-            return Int32(bits)
+            return .success(Int32(bits))
         }
     }
 
     /// Decodes a DC coefficient from the bit stream.
-    static func decodeDC<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) throws -> Int32 {
-        let cat = Int(try decodeSymbol(from: &reader, table: table))
-        return try decodeValue(from: &reader, category: cat)
+    static func decodeDCCore<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) -> JLICoreOutcome<Int32> {
+        let coreOutcome1 = decodeSymbolCore(from: &reader, table: table)
+        guard case .success(let coreValue1) = coreOutcome1 else { return .failure(coreOutcome1.failureValue) }
+        let cat = Int(coreValue1)
+        return decodeValueCore(from: &reader, category: cat)
     }
 
     /// Decodes the 63 AC coefficients of a block from the bit stream.
@@ -381,14 +390,15 @@ enum HuffmanDecoder {
         }
     }
 
-    static func decodeAC<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table,
-        into out: UnsafeMutableBufferPointer<Int32>) throws {
+    static func decodeACCore<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table,
+        into out: UnsafeMutableBufferPointer<Int32>) -> JLICoreOutcome<Void> {
         precondition(out.count == 64)
         for i in 0..<64 { out[i] = 0 }
 
         var index = 1
         while index < 64 {
-            let symbol = try decodeSymbol(from: &reader, table: table)
+            let coreOutcome1 = decodeSymbolCore(from: &reader, table: table)
+            guard case .success(let symbol) = coreOutcome1 else { return .failure(coreOutcome1.failureValue) }
 
             if symbol == 0x00 {
                 break  // EOB — remaining coefficients are zero
@@ -403,9 +413,12 @@ enum HuffmanDecoder {
             index += zeroRun
             guard index < 64 else { break }
 
-            out[index] = try decodeValue(from: &reader, category: cat)
+            let coreOutcome2 = decodeValueCore(from: &reader, category: cat)
+            guard case .success(let coreValue2) = coreOutcome2 else { return .failure(coreOutcome2.failureValue) }
+            out[index] = coreValue2
             index += 1
         }
+        return .success(())
     }
 }
 

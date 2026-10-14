@@ -136,14 +136,18 @@ struct BitReader {
 
     init(borrowing data: UnsafeRawBufferPointer) { self.data = JPEGByteView(borrowing: data) }
 
+    mutating func readBit() throws -> UInt32 { try jliCompatibility { readBitCore() } }
+    mutating func readBits(_ count: Int) throws -> UInt32 { try jliCompatibility { readBitsCore(count) } }
+    mutating func skipRestartMarker(expectedIndex: Int) throws { try jliCompatibility { skipRestartMarkerCore(expectedIndex: expectedIndex) } }
+
     /// Whether there is more data to read.
     var hasMore: Bool {
         byteOffset < data.count || bitsAvailable > 0
     }
 
     /// Reads a single bit.
-    mutating func readBit() throws -> UInt32 {
-        return try readBits(1)
+    mutating func readBitCore() -> JLICoreOutcome<UInt32> {
+        return readBitsCore(1)
     }
 
     /// True when any byte of `x` equals `0xFF` (SWAR zero-byte test on `~x`).
@@ -173,20 +177,20 @@ struct BitReader {
     }
 
     /// Reads `count` bits and returns them as an unsigned integer.
-    mutating func readBits(_ count: Int) throws -> UInt32 {
+    mutating func readBitsCore(_ count: Int) -> JLICoreOutcome<UInt32> {
         // Every legitimate JPEG bit-read is ≤ 16 bits (magnitude categories ≤ 15,
         // EOBRUN appendages ≤ 14). A larger width only arises from a malformed or
         // forged Huffman table (whose decoded "category" can be any byte) — throw.
         guard count >= 0, count <= 16 else {
-            throw JLIError.decodingFailed("invalid bit-read width \(count)")
+            return .failure(JLICoreFailure(code: 123, kind: .decoding, detail0: Int(count)))
         }
         while bitsAvailable < count {
             if bulkRefill() { break }
-            try loadByte()
+            if case .failure(let failure) = loadByte() { return .failure(failure) }
         }
         bitsAvailable -= count
         let value = (bitBuffer >> UInt64(bitsAvailable)) & ((1 << UInt64(count)) - 1)
-        return UInt32(truncatingIfNeeded: value)
+        return .success(UInt32(truncatingIfNeeded: value))
     }
 
     /// Table-driven fast path for short (≤8-bit) Huffman codes.
@@ -235,16 +239,16 @@ struct BitReader {
     }
 
     /// Loads the next byte from the data, handling byte stuffing.
-    private mutating func loadByte() throws {
+    private mutating func loadByte() -> JLICoreOutcome<Void> {
         guard byteOffset < data.count else {
-            throw JLIError.decodingFailed("Unexpected end of entropy-coded data")
+            return .failure(JLICoreFailure(code: 124, kind: .decoding))
         }
         let byte = data[byteOffset]
         byteOffset += 1
 
         if byte == 0xFF {
             guard byteOffset < data.count else {
-                throw JLIError.decodingFailed("Unexpected end of data after 0xFF")
+                return .failure(JLICoreFailure(code: 125, kind: .decoding))
             }
             let next = data[byteOffset]
             if next == 0x00 {
@@ -252,12 +256,13 @@ struct BitReader {
                 byteOffset += 1
             } else {
                 // This is a marker, not data — should not happen in entropy segment
-                throw JLIError.decodingFailed("Unexpected marker 0xFF\(String(format: "%02X", next)) in entropy data")
+                return .failure(JLICoreFailure(code: 126, kind: .decoding, detail0: Int(next)))
             }
         }
 
         bitBuffer = (bitBuffer << 8) | UInt64(byte)
         bitsAvailable += 8
+        return .success(())
     }
 
     /// Aligns the reader to the next byte boundary by discarding the partial
@@ -279,7 +284,7 @@ struct BitReader {
     /// cycles 0–7 (`RST0`–`RST7`), so the caller passes `mcuCount / restartInterval & 7`.
     ///
     /// JPEG allows fill bytes (`0xFF 0xFF…`) before any marker; we tolerate them here.
-    mutating func skipRestartMarker(expectedIndex: Int) throws {
+    mutating func skipRestartMarkerCore(expectedIndex: Int) -> JLICoreOutcome<Void> {
         alignToByte()
         // Skip any 0xFF fill bytes that precede the marker.
         while byteOffset < data.count - 1, data[byteOffset] == 0xFF,
@@ -287,24 +292,21 @@ struct BitReader {
             byteOffset += 1
         }
         guard byteOffset + 1 < data.count else {
-            throw JLIError.decodingFailed("Unexpected end of data expecting RST marker")
+            return .failure(JLICoreFailure(code: 127, kind: .decoding))
         }
         guard data[byteOffset] == 0xFF else {
-            throw JLIError.decodingFailed(
-                "Expected RST marker at offset \(byteOffset), got 0x\(String(format: "%02X", data[byteOffset]))"
-            )
+            return .failure(JLICoreFailure(code: 128, kind: .decoding, detail0: Int(byteOffset), detail1: Int(data[byteOffset])))
         }
         let expected = UInt8(0xD0 + (expectedIndex & 7))
         let got = data[byteOffset + 1]
         guard got >= 0xD0 && got <= 0xD7 else {
-            throw JLIError.decodingFailed(
-                "Expected RST\(expectedIndex & 7) (0xFF D\(expectedIndex & 7)), got 0xFF \(String(format: "%02X", got))"
-            )
+            return .failure(JLICoreFailure(code: 129, kind: .decoding, detail0: Int(expectedIndex & 7), detail1: Int(expectedIndex & 7), detail2: Int(got)))
         }
         // Some encoders emit RSTs out of strict cyclic order on damaged streams,
         // but ImageIO/libjpeg always cycle 0–7. Accept what we got but warn via
         // throwing if it diverges — for now we accept any RST byte for robustness.
         _ = expected
         byteOffset += 2
+        return .success(())
     }
 }

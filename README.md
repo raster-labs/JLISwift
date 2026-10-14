@@ -12,7 +12,7 @@ A native-Swift JPEG codec for Apple platforms, with Accelerate-backed DSP.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Raster-Lab/JLISwift.git", from: "0.1.0"),
+    .package(url: "https://github.com/raster-labs/JLISwift.git", from: "0.6.0"),
 ]
 ```
 
@@ -34,6 +34,21 @@ let decoded = try JLIDecoder().decode(from: jpegData)
 let info = try JLIDecoder().inspect(data: jpegData)
 print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 ```
+
+## Caller-owned decode storage
+
+Applications that admit their own buffers can use the synchronous borrowed APIs:
+
+- `inspectBaselineRGBCore` / `decodeBaselineRGBCore`: sequential 8-bit, three-component JPEG to RGB8, including the existing source-color interpretation and chroma sampling rules.
+- `inspectLosslessMonochromeCore` / `decodeLosslessMonochromeCore`: monochrome SOF3 at its declared precision, reconstructed directly as unsigned little-endian UInt16 samples.
+
+Inspect baseline input with `JLIDecoder.baselineHeaderWorkspaceByteCount` bytes of header storage. The returned `BaselineRGBInfo` specifies the complete workspace and arena sizes. The arena retains **12 bytes per source pixel** after its first **3 bytes per pixel** are compacted to RGB8; account for the full retained arena capacity. The lossless workspace size is `JLIDecoder.losslessMonochromeWorkspaceByteCount`; its result describes the required output size. These APIs reuse the canonical parser, Huffman, prediction, IDCT and color kernels.
+
+All supplied spans must remain alive until return. Input, output/arena and workspace must be disjoint; workspace and baseline arena require `Int` alignment and exclusive raw storage. The library borrows them without taking ownership. A failure or cancellation may leave partial pixels, so publish output only after success. Metadata payloads are not returned by these pixel-only APIs.
+
+Core APIs return `JLICoreOutcome<Value>` with `.success(Value)` or `.failure(JLICoreFailure)`. The failure contains only `kind`, `code`, and three integer details; the qualified path does not invoke Swift error witnesses or throw hooks. `JLICancellation` accepts a synchronous C function pointer and a borrowed context, allowing the application to check its own cancellation flag without a captured closure. Its callback must be thread-safe and allocation-free, and its context must remain alive until return. The default is `.never`; cancellation takes effect at parser, row and tile checkpoints. The original APIs retain their existing `JLIError`/task-cancellation compatibility behavior.
+
+Reported capacities cover the explicit parser, control and numerical storage. Applications must also qualify their caller, runtime and compiled execution profile when enforcing a complete process allocation contract.
 
 ## What's actually implemented
 
@@ -57,7 +72,7 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | **Near-lossless** via point transform (`losslessPointTransform`, bounded error 2^Pt−1) | ✅ |
 | **Reduced-scale decode** — 1/2, 1/4, 1/8 (exact box averages from low-frequency coefficients, `scale`) | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
-| Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
+| Accelerate forward DCT/quantization, shared SIMD inverse DCT and BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
 | **jpegli perceptual quant tables** — libjxl base matrices + non-linear distance scale (`perceptualQuantTables`, opt-in) | ✅ |

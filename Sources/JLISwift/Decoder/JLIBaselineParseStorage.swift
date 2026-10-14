@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /// Fixed descriptors for the canonical parser's RGB sequential storage policy.
-final class JLIBaselineParseStorage: JPEGParseCapture {
+struct JLIBaselineParseStorage {
+    let records: JPEGCallerRecords
+    private let state: UnsafeMutablePointer<State>
+    private struct State {
+        var scanCount = 0
+        var seenComponents: UInt8 = 0
+        var adobeTransform: UInt8?
+    }
     typealias Descriptor = JLILosslessParseStorage.Descriptor
     static let byteCount = 16_384
     let maximumScans = 3
@@ -11,13 +18,14 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
     private let restartIntervals: UnsafeMutableBufferPointer<Int>
     private let entropyRanges: UnsafeMutableBufferPointer<Range<Int>>
     private let iccRanges: UnsafeMutableBufferPointer<Range<Int>>
+    let huffmanViews: UnsafeMutableBufferPointer<BorrowedHuffmanTable>
     private let dct: UnsafeMutableBufferPointer<Float>
     private let transposedDCT: UnsafeMutableBufferPointer<Float>
     private let zigzag: UnsafeMutableBufferPointer<Int>
     private let inverseZigzag: UnsafeMutableBufferPointer<Int>
-    private(set) var scanCount = 0
-    private var seenComponents: UInt8 = 0
-    private(set) var adobeTransform: UInt8?
+    var scanCount: Int { state.pointee.scanCount }
+    var seenComponents: UInt8 { state.pointee.seenComponents }
+    var adobeTransform: UInt8? { state.pointee.adobeTransform }
     func accepts(componentCount: Int) -> Bool { (1...3).contains(componentCount) }
 
     init(workspace: UnsafeMutableRawBufferPointer) {
@@ -40,7 +48,11 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
         // supported 64-bit targets, descriptors + constants occupy 7,072 of 16,384 bytes.
         dct = buffer(Float.self, 64); transposedDCT = buffer(Float.self, 64)
         zigzag = buffer(Int.self, 64); inverseZigzag = buffer(Int.self, 64)
-        precondition(offset <= Self.byteCount)
+        state = buffer(State.self, 1).baseAddress!
+        state.initialize(to: State())
+        huffmanViews = buffer(BorrowedHuffmanTable.self, 6)
+        precondition(offset <= 8192)
+        records = JPEGCallerRecords(UnsafeMutableRawBufferPointer(rebasing: workspace[8192..<12288]))
     }
 
     /// Called only after full decode capacity admission. These pointers remain
@@ -68,7 +80,7 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
         if marker == 0xee, range.count >= 12,
            input[start] == 65, input[start + 1] == 100, input[start + 2] == 111,
            input[start + 3] == 98, input[start + 4] == 101 {
-            adobeTransform = input[start + 11]
+            state.pointee.adobeTransform = input[start + 11]
         }
         if marker == JPEGMarker.app2, range.count >= 14 {
             let identifier: StaticString = "ICC_PROFILE\0"
@@ -79,31 +91,33 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
             }
         }
     }
-    func scan(_ scan: JPEGScanHeader, frame: JPEGFrameInfo?, entropy: Range<Int>, restartInterval: Int) throws {
-        guard let frame, !frame.isLossless, !frame.isProgressive, frame.precision == 8,
+    func scan(_ scan: JPEGScanHeader, frame: JPEGFrameSlot, entropy: Range<Int>, restartInterval: Int) -> JLICoreOutcome<Void> {
+        guard case .some(let frame) = frame, !frame.isLossless, !frame.isProgressive, frame.precision == 8,
               frame.components.count == 3, scan.spectralStart == 0, scan.spectralEnd == 63,
               scan.successiveApproxHigh == 0, scan.successiveApproxLow == 0 else {
-            throw JLIError.unsupportedJPEGFeature("Caller-storage RGB requires sequential 8-bit JPEG")
+            return .failure(JLICoreFailure(code: 134, kind: .unsupported))
         }
         for component in scan.components {
             guard let index = frame.components.firstIndex(where: { $0.id == component.componentSelector }),
                   seenComponents & (1 << index) == 0 else {
-                throw JLIError.decodingFailed("Repeated or unknown sequential scan component")
+                return .failure(JLICoreFailure(code: 135, kind: .decoding))
             }
             guard (0..<4).contains(frame.components[index].quantTableIndex) else {
-                throw JLIError.decodingFailed("Invalid quantization table selector")
+                return .failure(JLICoreFailure(code: 136, kind: .decoding))
             }
             selectedQuantization[index] = quantization[frame.components[index].quantTableIndex]
-            seenComponents |= 1 << index
+            state.pointee.seenComponents |= 1 << index
             snapshots[scanCount * 6 + index * 2] = tables[component.dcTableId]
             snapshots[scanCount * 6 + index * 2 + 1] = tables[16 + component.acTableId]
         }
         restartIntervals[scanCount] = restartInterval
         entropyRanges[scanCount] = entropy
-        scanCount += 1
+        state.pointee.scanCount += 1
+        return .success(())
     }
-    func validateCoverage() throws {
-        guard seenComponents == 7 else { throw JLIError.decodingFailed("Incomplete sequential component scans") }
+    func validateCoverage() -> JLICoreOutcome<Void> {
+        guard seenComponents == 7 else { return .failure(JLICoreFailure(code: 137, kind: .decoding)) }
+        return .success(())
     }
     func entropy(_ scan: Int) -> Range<Int> { entropyRanges[scan] }
     func restartInterval(_ scan: Int) -> Int { restartIntervals[scan] }
@@ -121,14 +135,13 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
         var chunks = 0, total = 0
         for index in 1..<256 where iccRanges[index].lowerBound != -1 { chunks += 1; total += iccRanges[index].count }
         guard chunks > 0 else { return false }
-        let expected = XYBICCProfile.data
-        guard total == expected.count else { return false }
+        guard total == XYBICCProfile.count else { return false }
         var position = 0
         for index in 1...chunks {
             let range = iccRanges[index]
             guard range.lowerBound >= 0 else { return false }
             for byte in range {
-                guard input[byte] == expected[position] else { return false }
+                guard input[byte] == XYBICCProfile.byte(at: position) else { return false }
                 position += 1
             }
         }
