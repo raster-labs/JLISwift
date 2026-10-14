@@ -1,6 +1,6 @@
 {
   "version": "0.6.0",
-  "sourceManifestSHA256": "ca4e1650f3424e70920156229a9f7e19cdadc46928e370fef2befb112387798d",
+  "sourceManifestSHA256": "c3c7dabdf510fdb1c305bbbc210b41488d189e29a1905a9af82883632b60b84a",
   "sources": {
     "Package.swift": "927905f47c5023ae02847168ab0cf03e2c8a5f18b25bc209314a95cdec91da1d",
     "Sources/JLIBench/Codecs/Butteraugli.swift": "1a3337ed5dcb9fa60c56c41f57f1454b2102fe9d28e4bbfb9ffb559422257533",
@@ -73,7 +73,7 @@
     "Tests/JLISwiftTests/FuzzTests.swift": "92aae86172bc556d93231bdafc745ef1be3674a2693a34a37b4bdb2cea90e706",
     "Tests/JLISwiftTests/HuffmanTests.swift": "8c32e980214012140e54d1a907e2b19c7f3860070267ed43ea52abbddf9270fc",
     "Tests/JLISwiftTests/IDCTConformanceTests.swift": "efd481869b5dac2a8f649854e25146a55799bfaf8b27f54f5ef1c20a21e529f2",
-    "Tests/JLISwiftTests/InPlaceChromaTests.swift": "78b20fa4abc4787fa51ac39ce22c7b66efdbd442f371a5377cc90fdbf414c5b8",
+    "Tests/JLISwiftTests/InPlaceChromaTests.swift": "a628001022b23a00300b6cf1ab5849bc73156fd1ab9bcf642d0fedf5541f749c",
     "Tests/JLISwiftTests/JLISwiftTests.swift": "11c2770684c12be14edb5b8480d8ff7f220f7432140daa1810c7a1b898630778",
     "Tests/JLISwiftTests/LosslessCallerStorageTests.swift": "ed829ae4ab23399042294bd5d83abae6dd7613fd4931d85b8f1e83c5714c9006",
     "Tests/JLISwiftTests/LosslessRestartTests.swift": "9afc248e9aafac654f19b3ea402c0e3a3f7bc78b7c41dae6ae60cd6e04b8ed66",
@@ -92,5 +92,9 @@
     "Tests/JLISwiftTests/XYBTests.swift": "069769ea1100586cd292ddb46e52f69211122e1570832eb4abd89dd9f66076f8"
   },
   "assemblySHA256": "5c4149eabd912397c6375092971dbee82796cfcbe7d5dc6be3cad43330a53cb2",
-  "silSHA256": "57e9a9be13e7a52b9fc0a8d014fee0039b7e3e5e6b2283e4951740c6e32660e8"
+  "silSHA256": "57e9a9be13e7a52b9fc0a8d014fee0039b7e3e5e6b2283e4951740c6e32660e8",
+  "compilationSourceManifestSHA256": "ca4e1650f3424e70920156229a9f7e19cdadc46928e370fef2befb112387798d",
+  "testOnlyDelta": {
+    "Tests/JLISwiftTests/InPlaceChromaTests.swift": "Equivalent explicitly typed fixture expression for Swift 6.3.3 CI type-checker; no production source change."
+  }
 }

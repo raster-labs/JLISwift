@@ -42,3 +42,7 @@ Validation on the final production source:
 
 The final DICOMKit/Mayam linked probe and admission validation remain consumer
 requirements; these package receipts do not declare those applications qualified.
+
+A test-only fixture expression was subsequently split into explicitly typed scalar
+steps for the hosted Swift 6.3.3 type-checker. All production hashes remain identical;
+the source manifest distinguishes the original compilation manifest and this delta.

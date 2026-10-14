@@ -10,7 +10,12 @@ struct InPlaceChromaTests {
                 for hm in 1...4 { for vm in 1...4 {
                     for hs in 1...hm { for vs in 1...vm {
                         let w = (tw * hs + hm - 1) / hm, h = (th * vs + vm - 1) / vm
-                        let source = (0..<(w * h)).map { Float(($0 * 71 + 19) % 256) + Float($0 % 4) / 4 }
+                        let sampleCount = w * h
+                        let source: [Float] = (0..<sampleCount).map { (index: Int) -> Float in
+                            let integerPart = Float((index * 71 + 19) % 256)
+                            let fraction = Float(index % 4) / Float(4)
+                            return integerPart + fraction
+                        }
                         for centered in [false, true] {
                             let expected = centered ? ChromaSampling.upsampleJPEG(source, width: w, height: h,
                                 targetWidth: tw, targetHeight: th, horizontalSampling: hs, verticalSampling: vs,
