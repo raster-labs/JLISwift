@@ -96,22 +96,22 @@ enum ColorConversion {
     // opsin `mul = 1`, so the absorbance matrix is used unscaled.
 
     /// Opsin absorbance matrix (linear RGB → LMS-ish mixed signal), rows sum to 1.
-    private static let opsinM: [[Float]] = [
-        [0.30, 0.622, 0.078],
-        [0.23, 0.692, 0.078],
-        [0.24342268924547819, 0.20476744424496821, 0.5518098665095536],
-    ]
+    private static let opsinM: ((Float, Float, Float), (Float, Float, Float), (Float, Float, Float)) = (
+        (0.30, 0.622, 0.078),
+        (0.23, 0.692, 0.078),
+        (0.24342268924547819, 0.20476744424496821, 0.5518098665095536)
+    )
     /// Inverse of `opsinM` (libjxl `kDefaultInverseOpsinAbsorbanceMatrix`).
-    private static let opsinInvM: [[Float]] = [
-        [11.031566901960783, -9.866943921568629, -0.16462299647058826],
-        [-3.254147380392157, 4.418770392156863, -0.16462299647058826],
-        [-3.6588512862745097, 2.7129230470588235, 1.9459282392156863],
-    ]
+    private static let opsinInvM: ((Float, Float, Float), (Float, Float, Float), (Float, Float, Float)) = (
+        (11.031566901960783, -9.866943921568629, -0.16462299647058826),
+        (-3.254147380392157, 4.418770392156863, -0.16462299647058826),
+        (-3.6588512862745097, 2.7129230470588235, 1.9459282392156863)
+    )
     private static let opsinBias: Float = 0.0037930732552754493
     private static let opsinBiasCbrt: Float = cbrt(0.0037930732552754493)
     /// `kScaledXYBOffset` / `kScaledXYBScale` — map XYB to the [0,1] sample range.
-    private static let xybOffset: [Float] = [0.015386134, 0.0, 0.27770459]
-    private static let xybScale: [Float] = [22.995788804, 1.183000077, 1.502141333]
+    private static let xybOffset: (Float, Float, Float) = (0.015386134, 0.0, 0.27770459)
+    private static let xybScale: (Float, Float, Float) = (22.995788804, 1.183000077, 1.502141333)
 
     /// sRGB encoded [0,1] → linear [0,1] (IEC 61966-2-1 EOTF).
     @inline(__always) static func srgbToLinear(_ c: Float) -> Float {
@@ -126,34 +126,34 @@ enum ColorConversion {
     /// unclamped). These are the values the encoder level-shifts and DCT-codes.
     static func rgbToXYBSample(r: Float, g: Float, b: Float) -> (x: Float, y: Float, bOut: Float) {
         let rl = srgbToLinear(r / 255.0), gl = srgbToLinear(g / 255.0), bl = srgbToLinear(b / 255.0)
-        let m0 = max(0, opsinM[0][0] * rl + opsinM[0][1] * gl + opsinM[0][2] * bl + opsinBias)
-        let m1 = max(0, opsinM[1][0] * rl + opsinM[1][1] * gl + opsinM[1][2] * bl + opsinBias)
-        let m2 = max(0, opsinM[2][0] * rl + opsinM[2][1] * gl + opsinM[2][2] * bl + opsinBias)
+        let m0 = max(0, opsinM.0.0 * rl + opsinM.0.1 * gl + opsinM.0.2 * bl + opsinBias)
+        let m1 = max(0, opsinM.1.0 * rl + opsinM.1.1 * gl + opsinM.1.2 * bl + opsinBias)
+        let m2 = max(0, opsinM.2.0 * rl + opsinM.2.1 * gl + opsinM.2.2 * bl + opsinBias)
         let lc = cbrt(m0) - opsinBiasCbrt
         let mc = cbrt(m1) - opsinBiasCbrt
         let sc = cbrt(m2) - opsinBiasCbrt
         let capX = 0.5 * (lc - mc)
         let capY = 0.5 * (lc + mc)
         let capB = sc
-        let sX = (capX + xybOffset[0]) * xybScale[0]
-        let sY = (capY + xybOffset[1]) * xybScale[1]
-        let sB = (capB - capY + xybOffset[2]) * xybScale[2]   // B sample carries B−Y
+        let sX = (capX + xybOffset.0) * xybScale.0
+        let sY = (capY + xybOffset.1) * xybScale.1
+        let sB = (capB - capY + xybOffset.2) * xybScale.2   // B sample carries B−Y
         return (sX * 255.0, sY * 255.0, sB * 255.0)
     }
 
     /// Inverts ``rgbToXYBSample`` — scaled-XYB samples (0–255) back to sRGB (0–255).
     static func xybSampleToRGB(x sX: Float, y sY: Float, bChannel sB: Float) -> (r: Float, g: Float, b: Float) {
-        let capX = (sX / 255.0) / xybScale[0] - xybOffset[0]
-        let capY = (sY / 255.0) / xybScale[1] - xybOffset[1]
-        let capB = (sB / 255.0) / xybScale[2] - xybOffset[2] + capY
+        let capX = (sX / 255.0) / xybScale.0 - xybOffset.0
+        let capY = (sY / 255.0) / xybScale.1 - xybOffset.1
+        let capB = (sB / 255.0) / xybScale.2 - xybOffset.2 + capY
         let lc = capY + capX, mc = capY - capX, sc = capB
         let e0 = lc + opsinBiasCbrt, e1 = mc + opsinBiasCbrt, e2 = sc + opsinBiasCbrt
         let m0 = e0 * e0 * e0 - opsinBias       // undo cube-root, then subtract bias
         let m1 = e1 * e1 * e1 - opsinBias
         let m2 = e2 * e2 * e2 - opsinBias
-        let rl = opsinInvM[0][0] * m0 + opsinInvM[0][1] * m1 + opsinInvM[0][2] * m2
-        let gl = opsinInvM[1][0] * m0 + opsinInvM[1][1] * m1 + opsinInvM[1][2] * m2
-        let bl = opsinInvM[2][0] * m0 + opsinInvM[2][1] * m1 + opsinInvM[2][2] * m2
+        let rl = opsinInvM.0.0 * m0 + opsinInvM.0.1 * m1 + opsinInvM.0.2 * m2
+        let gl = opsinInvM.1.0 * m0 + opsinInvM.1.1 * m1 + opsinInvM.1.2 * m2
+        let bl = opsinInvM.2.0 * m0 + opsinInvM.2.1 * m1 + opsinInvM.2.2 * m2
         return (
             max(0, min(255, linearToSRGB(rl) * 255.0)),
             max(0, min(255, linearToSRGB(gl) * 255.0)),

@@ -7,25 +7,45 @@ enum Quantization {
     // MARK: - Zigzag Scan Order
 
     /// Maps zigzag position (0–63) to block index (row × 8 + col).
-    static let zigzagOrder: [Int] = [
-         0,  1,  8, 16,  9,  2,  3, 10,
-        17, 24, 32, 25, 18, 11,  4,  5,
-        12, 19, 26, 33, 40, 48, 41, 34,
-        27, 20, 13,  6,  7, 14, 21, 28,
-        35, 42, 49, 56, 57, 50, 43, 36,
-        29, 22, 15, 23, 30, 37, 44, 51,
-        58, 59, 52, 45, 38, 31, 39, 46,
-        53, 60, 61, 54, 47, 55, 62, 63
-    ]
+    static let zigzagOrder: [Int] = {
+        var order = [Int](repeating: 0, count: 64)
+        order.withUnsafeMutableBufferPointer { fillZigzagOrder($0) }
+        return order
+    }()
+
+    /// Canonical T.81 order encoded in literal bytes, with no Array temporary.
+    static func fillZigzagOrder(_ order: UnsafeMutableBufferPointer<Int>) {
+        precondition(order.count == 64)
+        let definition: StaticString = """
+        \u{00}\u{01}\u{08}\u{10}\u{09}\u{02}\u{03}\u{0a}\
+        \u{11}\u{18}\u{20}\u{19}\u{12}\u{0b}\u{04}\u{05}\
+        \u{0c}\u{13}\u{1a}\u{21}\u{28}\u{30}\u{29}\u{22}\
+        \u{1b}\u{14}\u{0d}\u{06}\u{07}\u{0e}\u{15}\u{1c}\
+        \u{23}\u{2a}\u{31}\u{38}\u{39}\u{32}\u{2b}\u{24}\
+        \u{1d}\u{16}\u{0f}\u{17}\u{1e}\u{25}\u{2c}\u{33}\
+        \u{3a}\u{3b}\u{34}\u{2d}\u{26}\u{1f}\u{27}\u{2e}\
+        \u{35}\u{3c}\u{3d}\u{36}\u{2f}\u{37}\u{3e}\u{3f}
+        """
+        definition.withUTF8Buffer { bytes in
+            precondition(bytes.count == 64)
+            for index in 0..<64 { order[index] = Int(bytes[index]) }
+        }
+    }
 
     /// Maps block index to zigzag position (inverse of `zigzagOrder`).
     static let inverseZigzagOrder: [Int] = {
         var inverse = [Int](repeating: 0, count: 64)
-        for i in 0..<64 {
-            inverse[zigzagOrder[i]] = i
+        zigzagOrder.withUnsafeBufferPointer { order in
+            inverse.withUnsafeMutableBufferPointer { fillInverseZigzagOrder(order, into: $0) }
         }
         return inverse
     }()
+
+    static func fillInverseZigzagOrder(_ order: UnsafeBufferPointer<Int>,
+                                      into inverse: UnsafeMutableBufferPointer<Int>) {
+        precondition(order.count == 64 && inverse.count == 64)
+        for index in 0..<64 { inverse[order[index]] = index }
+    }
 
     /// Reorders a block from natural order to zigzag order.
     static func zigzagScan(_ block: [Int32]) -> [Int32] {
