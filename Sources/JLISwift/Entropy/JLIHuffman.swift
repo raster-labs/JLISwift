@@ -51,39 +51,10 @@ struct HuffmanTable {
         var laLen = [UInt8](repeating: 0, count: 256)
         var laSym = [UInt8](repeating: 0, count: 256)
 
-        // Wider than the 16-bit codes it produces so canonical-code generation
-        // can't overflow on a malformed BITS array — a complete length-16 code
-        // walks `code` up to 2^16, one past UInt16's range. Stored codes still
-        // fit in 16 bits for any well-formed table.
-        var code: UInt32 = 0
-        var valueIndex = 0
-
-        for bitLength in 1...16 {
-            let count = Int(bits[bitLength - 1])
-            if count > 0 {
-                vPtr[bitLength] = valueIndex
-                minC[bitLength] = Int32(code)
-                for _ in 0..<count where valueIndex < values.count {
-                    let symbol = values[valueIndex]
-                    encoding[Int(symbol)] = (UInt16(truncatingIfNeeded: code), UInt8(bitLength))
-                    // Fill every 8-bit lookahead slot whose top `bitLength` bits
-                    // equal this code. A canonical code of length ≤8 is < 256,
-                    // so `code << (8 - bitLength)` and its run stay in 0...255.
-                    if bitLength <= 8 {
-                        let shift = 8 - bitLength
-                        let start = Int(code << shift)
-                        for k in start..<(start + (1 << shift)) {
-                            laLen[k] = UInt8(bitLength)
-                            laSym[k] = symbol
-                        }
-                    }
-                    valueIndex += 1
-                    code += 1
-                }
-                maxC[bitLength] = Int32(code - 1)
-            }
-            code <<= 1
-        }
+        compileHuffman(bits: { bits[$0] }, valueCount: values.count, value: { values[$0] },
+            encoding: { encoding[$0] = ($1, $2) }, maxCode: { maxC[$0] = $1 },
+            minCode: { minC[$0] = $1 }, valPtr: { vPtr[$0] = $1 },
+            lookahead: { laLen[$0] = $1; laSym[$0] = $2 })
 
         self.encodingTable = encoding
         self.maxCode = maxC
@@ -97,74 +68,42 @@ struct HuffmanTable {
 // MARK: - Standard JPEG Huffman Tables (ITU-T T.81 Annex K)
 
 /// Standard Huffman table definitions from the JPEG specification.
+/// Read-only literal bytes shared by owned and caller-storage table compilation.
+/// Hex literals avoid lazy Array allocation in caller-storage fallbacks.
+struct HuffmanDefinition {
+    let bitsHex: StaticString
+    let valuesHex: StaticString
+    var count: Int { valuesHex.utf8CodeUnitCount / 2 }
+    private func byte(_ hex: StaticString, _ index: Int) -> UInt8 {
+        hex.withUTF8Buffer { bytes in
+            func digit(_ c: UInt8) -> UInt8 { c <= 57 ? c - 48 : c - 87 }
+            return digit(bytes[index * 2]) * 16 + digit(bytes[index * 2 + 1])
+        }
+    }
+    func bit(_ index: Int) -> UInt8 { byte(bitsHex, index) }
+    func value(_ index: Int) -> UInt8 { byte(valuesHex, index) }
+    func owned() -> HuffmanTable {
+        HuffmanTable(bits: (0..<16).map { bit($0) }, values: (0..<count).map { value($0) })
+    }
+}
+
 enum StandardHuffmanTables {
-    /// DC luminance table (Table K.3).
-    static let dcLuminance = HuffmanTable(
-        bits: [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-        values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-    )
-
-    /// DC chrominance table (Table K.4).
-    static let dcChrominance = HuffmanTable(
-        bits: [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-        values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-    )
-
-    /// AC luminance table (Table K.5).
-    static let acLuminance = HuffmanTable(
-        bits: [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D],
-        values: [
-            0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
-            0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
-            0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
-            0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
-            0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
-            0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
-            0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-            0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
-            0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-            0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-            0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
-            0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-            0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
-            0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
-            0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
-            0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
-            0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
-            0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
-            0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
-            0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
-            0xF9, 0xFA
-        ]
-    )
-
-    /// AC chrominance table (Table K.6).
-    static let acChrominance = HuffmanTable(
-        bits: [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77],
-        values: [
-            0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
-            0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
-            0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
-            0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
-            0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34,
-            0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
-            0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38,
-            0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
-            0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
-            0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
-            0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
-            0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-            0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96,
-            0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
-            0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
-            0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
-            0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2,
-            0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
-            0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
-            0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
-            0xF9, 0xFA
-        ]
-    )
+    static let dcLuminanceDefinition = HuffmanDefinition(
+        bitsHex: "00010501010101010100000000000000",
+        valuesHex: "000102030405060708090a0b")
+    static let dcLuminance = dcLuminanceDefinition.owned()
+    static let dcChrominanceDefinition = HuffmanDefinition(
+        bitsHex: "00030101010101010101010000000000",
+        valuesHex: "000102030405060708090a0b")
+    static let dcChrominance = dcChrominanceDefinition.owned()
+    static let acLuminanceDefinition = HuffmanDefinition(
+        bitsHex: "0002010303020403050504040000017d",
+        valuesHex: "01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa")
+    static let acLuminance = acLuminanceDefinition.owned()
+    static let acChrominanceDefinition = HuffmanDefinition(
+        bitsHex: "00020102040403040705040400010277",
+        valuesHex: "000102031104052131061241510761711322328108144291a1b1c109233352f0156272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a636465666768696a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9fa")
+    static let acChrominance = acChrominanceDefinition.owned()
 }
 
 // MARK: - Optimal Huffman Table Generation
@@ -364,7 +303,7 @@ enum HuffmanEncoder {
 enum HuffmanDecoder {
 
     /// Decodes a single Huffman symbol from the bit stream.
-    static func decodeSymbol(from reader: inout BitReader, table: HuffmanTable) throws -> UInt8 {
+    static func decodeSymbol<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) throws -> UInt8 {
         // Fast path: resolve short (≤8-bit) codes from an 8-bit lookahead table.
         // Falls through to the bit-by-bit walk for long codes and any byte near
         // a marker / end of data, so all error and restart handling is unchanged.
@@ -378,8 +317,8 @@ enum HuffmanDecoder {
     /// marker, EOF, and malformed-table handling. ``decodeSymbol(from:table:)``
     /// only short-circuits to the lookahead table when it can prove the result
     /// is identical to this walk.
-    static func decodeSymbolBitByBit(
-        from reader: inout BitReader, table: HuffmanTable
+    static func decodeSymbolBitByBit<Table: HuffmanDecodeTable>(
+        from reader: inout BitReader, table: Table
     ) throws -> UInt8 {
         var code: Int32 = 0
 
@@ -405,6 +344,7 @@ enum HuffmanDecoder {
     /// Decodes a signed value from additional bits after a Huffman category.
     static func decodeValue(from reader: inout BitReader, category cat: Int) throws -> Int32 {
         guard cat > 0 else { return 0 }
+        guard cat <= 16 else { throw JLIError.decodingFailed("Invalid Huffman value category") }
 
         let bits = try reader.readBits(cat)
         // If MSB is 0, the value is negative
@@ -416,7 +356,7 @@ enum HuffmanDecoder {
     }
 
     /// Decodes a DC coefficient from the bit stream.
-    static func decodeDC(from reader: inout BitReader, table: HuffmanTable) throws -> Int32 {
+    static func decodeDC<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table) throws -> Int32 {
         let cat = Int(try decodeSymbol(from: &reader, table: table))
         return try decodeValue(from: &reader, category: cat)
     }
@@ -436,6 +376,13 @@ enum HuffmanDecoder {
     static func decodeAC(
         from reader: inout BitReader, table: HuffmanTable, into out: inout [Int32]
     ) throws {
+        try out.withUnsafeMutableBufferPointer { buffer in
+            try decodeAC(from: &reader, table: table, into: buffer)
+        }
+    }
+
+    static func decodeAC<Table: HuffmanDecodeTable>(from reader: inout BitReader, table: Table,
+        into out: UnsafeMutableBufferPointer<Int32>) throws {
         precondition(out.count == 64)
         for i in 0..<64 { out[i] = 0 }
 
@@ -459,5 +406,90 @@ enum HuffmanDecoder {
             out[index] = try decodeValue(from: &reader, category: cat)
             index += 1
         }
+    }
+}
+
+// Shared canonical table compiler. Storage is supplied by the legacy table or
+// caller-workspace view; encoding storage is optional for decode-only consumers.
+private func compileHuffman(
+    bits: (Int) -> UInt8, valueCount: Int, value: (Int) -> UInt8,
+    encoding: (Int, UInt16, UInt8) -> Void,
+    maxCode: (Int, Int32) -> Void, minCode: (Int, Int32) -> Void,
+    valPtr: (Int, Int) -> Void, lookahead: (Int, UInt8, UInt8) -> Void
+) {
+        // Wider than the 16-bit codes it produces so canonical-code generation
+        // can't overflow on a malformed BITS array — a complete length-16 code
+        // walks `code` up to 2^16, one past UInt16's range. Stored codes still
+        // fit in 16 bits for any well-formed table.
+        var code: UInt32 = 0
+        var valueIndex = 0
+
+        for bitLength in 1...16 {
+            let count = Int(bits(bitLength - 1))
+            if count > 0 {
+                valPtr(bitLength, valueIndex)
+                minCode(bitLength, Int32(code))
+                for _ in 0..<count where valueIndex < valueCount {
+                    let symbol = value(valueIndex)
+                    encoding(Int(symbol), UInt16(truncatingIfNeeded: code), UInt8(bitLength))
+                    // Fill every 8-bit lookahead slot whose top `bitLength` bits
+                    // equal this code. A canonical code of length ≤8 is < 256,
+                    // so `code << (8 - bitLength)` and its run stay in 0...255.
+                    if bitLength <= 8 {
+                        let shift = 8 - bitLength
+                        let start = Int(code << shift)
+                        for k in start..<(start + (1 << shift)) {
+                            lookahead(k, UInt8(bitLength), symbol)
+                        }
+                    }
+                    valueIndex += 1
+                    code += 1
+                }
+                maxCode(bitLength, Int32(code - 1))
+            }
+            code <<= 1
+        }
+
+ }
+
+protocol HuffmanDecodeTable {
+    associatedtype Codes: RandomAccessCollection where Codes.Index == Int, Codes.Element == Int32
+    associatedtype Offsets: RandomAccessCollection where Offsets.Index == Int, Offsets.Element == Int
+    associatedtype Bytes: RandomAccessCollection where Bytes.Index == Int, Bytes.Element == UInt8
+    var maxCode: Codes { get }
+    var minCode: Codes { get }
+    var valPtr: Offsets { get }
+    var values: Bytes { get }
+    var lookaheadLength: Bytes { get }
+    var lookaheadSymbol: Bytes { get }
+}
+extension HuffmanTable: HuffmanDecodeTable {}
+
+/// A decode-only table in caller workspace. No Array storage or encoder table.
+struct BorrowedHuffmanTable: HuffmanDecodeTable {
+    let maxCode: UnsafeMutableBufferPointer<Int32>
+    let minCode: UnsafeMutableBufferPointer<Int32>
+    let valPtr: UnsafeMutableBufferPointer<Int>
+    let values: UnsafeMutableBufferPointer<UInt8>
+    let lookaheadLength: UnsafeMutableBufferPointer<UInt8>
+    let lookaheadSymbol: UnsafeMutableBufferPointer<UInt8>
+    static let byteCount = 1040
+
+    init(workspace: UnsafeMutableRawBufferPointer, valueCount: Int,
+         bits: (Int) -> UInt8, value: (Int) -> UInt8) {
+        precondition(workspace.count >= Self.byteCount && valueCount <= 256)
+        func buffer<T>(_ type: T.Type, _ offset: Int, _ count: Int) -> UnsafeMutableBufferPointer<T> {
+            UnsafeMutableRawBufferPointer(rebasing: workspace[offset..<(offset + count * MemoryLayout<T>.stride)])
+                .bindMemory(to: T.self)
+        }
+        maxCode = buffer(Int32.self, 0, 17); minCode = buffer(Int32.self, 68, 17)
+        valPtr = buffer(Int.self, 136, 17); values = buffer(UInt8.self, 272, valueCount)
+        lookaheadLength = buffer(UInt8.self, 528, 256); lookaheadSymbol = buffer(UInt8.self, 784, 256)
+        maxCode.initialize(repeating: -1); minCode.initialize(repeating: -1); valPtr.initialize(repeating: 0)
+        lookaheadLength.initialize(repeating: 0); lookaheadSymbol.initialize(repeating: 0)
+        for index in 0..<valueCount { values[index] = value(index) }
+        compileHuffman(bits: bits, valueCount: valueCount, value: value, encoding: { _, _, _ in },
+            maxCode: { maxCode[$0] = $1 }, minCode: { minCode[$0] = $1 }, valPtr: { valPtr[$0] = $1 },
+            lookahead: { lookaheadLength[$0] = $1; lookaheadSymbol[$0] = $2 })
     }
 }

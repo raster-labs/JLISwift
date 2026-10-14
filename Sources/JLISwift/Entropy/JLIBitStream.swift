@@ -115,7 +115,7 @@ struct BitWriter {
 /// then consumes them below 8 remaining bits). `alignToByte` relies on this to
 /// rewind `byteOffset` over buffered whole bytes exactly.
 struct BitReader {
-    private let data: [UInt8]
+    private let data: JPEGByteView
     /// Current byte position in the data buffer.
     private(set) var byteOffset: Int = 0
     /// Bit accumulator (MSB-first in the low `bitsAvailable` bits).
@@ -124,15 +124,17 @@ struct BitReader {
     private var bitsAvailable: Int = 0
 
     init(data: [UInt8]) {
-        self.data = data
+        self.data = JPEGByteView(data)
     }
 
     /// Starts reading at `offset` — used by segment-parallel lossless decode,
     /// where each restart segment's reader begins just past its RST marker.
     init(data: [UInt8], startingAt offset: Int) {
-        self.data = data
+        self.data = JPEGByteView(data)
         self.byteOffset = min(max(0, offset), data.count)
     }
+
+    init(borrowing data: UnsafeRawBufferPointer) { self.data = JPEGByteView(borrowing: data) }
 
     /// Whether there is more data to read.
     var hasMore: Bool {
@@ -158,8 +160,8 @@ struct BitReader {
     @inline(__always)
     private mutating func bulkRefill() -> Bool {
         guard byteOffset + 8 <= data.count else { return false }
-        let word = data.withUnsafeBufferPointer { buf in
-            UInt64(bigEndian: UnsafeRawPointer(buf.baseAddress! + byteOffset)
+        let word = data.withUnsafeBytes { buf in
+            UInt64(bigEndian: (buf.baseAddress! + byteOffset)
                 .loadUnaligned(as: UInt64.self))
         }
         guard !Self.hasFFByte(word) else { return false }
@@ -199,7 +201,7 @@ struct BitReader {
     /// Because the lookahead table is derived from the same canonical codes and
     /// the prefix-free property holds, a non-`nil` result is bit-for-bit what the
     /// bit-by-bit walk would have produced.
-    mutating func fastDecodeSymbol(_ table: HuffmanTable) -> UInt8? {
+    mutating func fastDecodeSymbol<Table: HuffmanDecodeTable>(_ table: Table) -> UInt8? {
         if bitsAvailable < 8 { fillBuffer(upTo: 8) }
         guard bitsAvailable >= 8 else { return nil }
         let peek = Int((bitBuffer >> (bitsAvailable - 8)) & 0xFF)

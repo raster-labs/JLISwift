@@ -71,11 +71,18 @@ struct ParsedJPEG: Sendable {
 
 /// Reads and parses JPEG marker segments from a byte buffer.
 struct MarkerReader {
-    private let data: [UInt8]
+    private let data: JPEGByteView
+    private let callerStorage: (any JPEGParseCapture)?
     private var offset: Int = 0
+    private var nextCancellationCheckpoint = 65_536
 
     init(data: [UInt8]) {
-        self.data = data
+        self.data = JPEGByteView(data)
+        self.callerStorage = nil
+    }
+
+    init(borrowing data: UnsafeRawBufferPointer, storage: any JPEGParseCapture) {
+        self.data = JPEGByteView(borrowing: data); callerStorage = storage
     }
 
     /// Reads JPEG info without full decode.
@@ -135,7 +142,7 @@ struct MarkerReader {
         var sawEOI = false
         var adobeTransform: UInt8?
         var frameInfo: JPEGFrameInfo?
-        var quantTables = [[Int]](repeating: [Int](repeating: 0, count: 64), count: 4)
+        var quantTables = callerStorage == nil ? [[Int]](repeating: [Int](repeating: 0, count: 64), count: 4) : []
         var huffDC = [Int: HuffmanTable]()
         var huffAC = [Int: HuffmanTable]()
         var scans: [JPEGScanData] = []
@@ -144,6 +151,7 @@ struct MarkerReader {
         var iccChunks: [Int: [UInt8]] = [:]   // sequence number → chunk payload
 
         markers: while offset < data.count - 1 {
+            if callerStorage != nil { try Task.checkCancellation() }
             guard let marker = try nextMarker() else { break }
 
             switch marker {
@@ -172,12 +180,19 @@ struct MarkerReader {
 
             case JPEGMarker.dri:
                 // Length=4, then 2-byte restart interval.
-                _ = try readUInt16()
+                guard try readUInt16() == 4 else { throw JLIError.decodingFailed("Invalid DRI length") }
                 restartInterval = Int(try readUInt16())
 
             case JPEGMarker.sos:
                 let scanHeader = try readSOS()
-                let entropyData = try readEntropyData()
+                if let callerStorage, scans.count >= callerStorage.maximumScans {
+                    throw JLIError.unsupportedJPEGFeature("Too many caller-storage scans")
+                }
+                let entropyRange = try readEntropyRange()
+                if let callerStorage {
+                    try callerStorage.scan(scanHeader, frame: frameInfo, entropy: entropyRange, restartInterval: restartInterval)
+                }
+                let entropyData = callerStorage == nil ? Array(data[entropyRange]) : []
                 // Snapshot the tables active right now (progressive redefines them).
                 scans.append(JPEGScanData(
                     header: scanHeader, entropyData: entropyData,
@@ -192,12 +207,22 @@ struct MarkerReader {
                 break markers
 
             case 0xee:
+                if let callerStorage {
+                    let range = try readSegmentRange()
+                    callerStorage.application(marker: marker, range: range, input: data)
+                    continue
+                }
                 let segment = try readSegmentBytes()
                 if segment.count >= 12 && Array(segment.prefix(5)) == [65, 100, 111, 98, 101] {
                     adobeTransform = segment[11]
                 }
 
             case JPEGMarker.app1:
+                if let callerStorage {
+                    let range = try readSegmentRange()
+                    callerStorage.application(marker: marker, range: range, input: data)
+                    continue
+                }
                 // Exif: "Exif\0\0" identifier then the TIFF payload we preserve.
                 let seg = try readSegmentBytes()
                 let exifID: [UInt8] = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]
@@ -206,6 +231,11 @@ struct MarkerReader {
                 }
 
             case JPEGMarker.app2:
+                if let callerStorage {
+                    let range = try readSegmentRange()
+                    callerStorage.application(marker: marker, range: range, input: data)
+                    continue
+                }
                 // ICC: "ICC_PROFILE\0" (12) + seq (1-based) + count, then a chunk
                 // of the profile. Accumulate by sequence number; reassemble below.
                 let seg = try readSegmentBytes()
@@ -259,6 +289,14 @@ struct MarkerReader {
 
     // MARK: - Private Parsing Methods
 
+    private mutating func segmentEnd(minimumPayload: Int) throws -> Int {
+        let payload = Int(try readUInt16()) - 2
+        guard payload >= minimumPayload, payload <= data.count - offset else {
+            throw JLIError.decodingFailed("Invalid or truncated JPEG segment length")
+        }
+        return offset + payload
+    }
+
     private mutating func validateSOI() throws {
         guard data.count >= 2, data[0] == 0xFF, data[1] == 0xD8 else {
             throw JLIError.invalidJPEGData
@@ -269,10 +307,12 @@ struct MarkerReader {
     /// Reads the next marker byte, skipping padding 0xFF bytes.
     private mutating func nextMarker() throws -> UInt8? {
         while offset < data.count {
+            try checkCancellation()
             if data[offset] == 0xFF {
                 offset += 1
                 // Skip padding 0xFF bytes
                 while offset < data.count && data[offset] == 0xFF {
+                    try checkCancellation()
                     offset += 1
                 }
                 if offset < data.count && data[offset] != 0x00 {
@@ -311,16 +351,26 @@ struct MarkerReader {
         return bytes
     }
 
+    private mutating func readSegmentRange() throws -> Range<Int> {
+        let end = try segmentEnd(minimumPayload: 0)
+        let start = offset
+        offset = end
+        return start..<end
+    }
+
     /// Reads a SOF (Start of Frame) marker.
     private mutating func readSOF(progressive: Bool, lossless: Bool = false) throws -> JPEGFrameInfo {
-        let length = try readUInt16()
-        let endOffset = offset + Int(length) - 2
+        let endOffset = try segmentEnd(minimumPayload: 6)
 
         let precision = Int(try readByte())
         let height = Int(try readUInt16())
         let width = Int(try readUInt16())
         let numComponents = Int(try readByte())
+        if let callerStorage, !callerStorage.accepts(componentCount: numComponents) {
+            throw JLIError.unsupportedJPEGFeature("Unsupported caller-storage component count")
+        }
 
+        guard endOffset - offset == numComponents * 3 else { throw JLIError.decodingFailed("Invalid SOF length") }
         var components = [JPEGComponentInfo]()
         for _ in 0..<numComponents {
             let id = try readByte()
@@ -347,8 +397,7 @@ struct MarkerReader {
 
     /// Reads a DQT (Define Quantization Table) marker.
     private mutating func readDQT() throws -> [(id: Int, values: [Int])] {
-        let length = Int(try readUInt16())
-        let endOffset = offset + length - 2
+        let endOffset = try segmentEnd(minimumPayload: 0)
         var tables = [(id: Int, values: [Int])]()
 
         while offset < endOffset {
@@ -366,6 +415,15 @@ struct MarkerReader {
                 throw JLIError.decodingFailed("invalid DQT table id \(tableId)")
             }
 
+            guard endOffset - offset >= 64 * (precision + 1) else { throw JLIError.decodingFailed("Truncated DQT segment") }
+            if let callerStorage {
+                let start = offset
+                for _ in 0..<64 {
+                    if precision == 0 { _ = try readByte() } else { _ = try readUInt16() }
+                }
+                callerStorage.quantization(id: tableId, precision: precision, range: start..<offset)
+                continue
+            }
             var values = [Int](repeating: 0, count: 64)
             for i in 0..<64 {
                 if precision == 0 {
@@ -382,8 +440,7 @@ struct MarkerReader {
 
     /// Reads a DHT (Define Huffman Table) marker.
     private mutating func readDHT() throws -> [(tableClass: Int, tableId: Int, table: HuffmanTable)] {
-        let length = Int(try readUInt16())
-        let endOffset = offset + length - 2
+        let endOffset = try segmentEnd(minimumPayload: 0)
         var tables = [(tableClass: Int, tableId: Int, table: HuffmanTable)]()
 
         while offset < endOffset {
@@ -391,35 +448,31 @@ struct MarkerReader {
             let tableClass = Int(info >> 4)
             let tableId = Int(info & 0x0F)
 
-            var bits = [UInt8](repeating: 0, count: 16)
+            guard endOffset - offset >= 16 else { throw JLIError.decodingFailed("Truncated DHT counts") }
+            let bitsStart = offset
             var totalValues = 0
-            for i in 0..<16 {
-                bits[i] = try readByte()
-                totalValues += Int(bits[i])
-            }
-            // Validate BITS forms a legal canonical Huffman code (T.81 Annex C):
-            // a table has ≤ 256 symbols, and at no bit length may the running
-            // code count exceed the 2^length slots available. Rejects forged or
-            // corrupted DHTs that would otherwise overflow code generation in
-            // `HuffmanTable.init`.
-            guard totalValues <= 256 else {
-                throw JLIError.decodingFailed("invalid DHT: \(totalValues) codes (max 256)")
-            }
             var codeSpace = 0
             for len in 1...16 {
-                codeSpace += Int(bits[len - 1])
+                let count = Int(try readByte())
+                totalValues += count
+                codeSpace += count
                 guard codeSpace <= (1 << len) else {
-                    throw JLIError.decodingFailed(
-                        "invalid DHT: Huffman code oversubscribed at length \(len)")
+                    throw JLIError.decodingFailed("invalid DHT: Huffman code oversubscribed at length \(len)")
                 }
                 codeSpace <<= 1
             }
-
-            var values = [UInt8]()
-            for _ in 0..<totalValues {
-                values.append(try readByte())
+            guard totalValues <= 256 else {
+                throw JLIError.decodingFailed("invalid DHT: \(totalValues) codes (max 256)")
             }
-
+            guard endOffset - offset >= totalValues else { throw JLIError.decodingFailed("Truncated DHT values") }
+            let valuesStart = offset
+            for _ in 0..<totalValues { _ = try readByte() }
+            if let callerStorage {
+                callerStorage.table(isDC: tableClass == 0, id: tableId, bits: bitsStart, values: valuesStart, count: totalValues)
+                continue
+            }
+            let bits = Array(data[bitsStart..<(bitsStart + 16)])
+            let values = Array(data[valuesStart..<(valuesStart + totalValues)])
             let table = HuffmanTable(bits: bits, values: values)
             tables.append((tableClass: tableClass, tableId: tableId, table: table))
         }
@@ -429,9 +482,13 @@ struct MarkerReader {
 
     /// Reads a SOS (Start of Scan) marker header.
     private mutating func readSOS() throws -> JPEGScanHeader {
-        _ = try readUInt16()  // length
+        let endOffset = try segmentEnd(minimumPayload: 4)
 
         let numComponents = Int(try readByte())
+        if let callerStorage, !callerStorage.accepts(componentCount: numComponents) {
+            throw JLIError.unsupportedJPEGFeature("Unsupported caller-storage component count")
+        }
+        guard endOffset - offset == numComponents * 2 + 3 else { throw JLIError.decodingFailed("Invalid SOS length") }
         var components = [(componentSelector: UInt8, dcTableId: Int, acTableId: Int)]()
 
         for _ in 0..<numComponents {
@@ -463,7 +520,7 @@ struct MarkerReader {
     /// stuffed `0xFF 0x00` pairs **and** restart markers (`0xFF 0xD0`–`0xFF 0xD7`).
     /// `BitReader` is the single point that performs unstuffing, and the decoder consumes
     /// restart markers explicitly at known MCU boundaries via `skipRestartMarker`.
-    private mutating func readEntropyData() throws -> [UInt8] {
+    private mutating func readEntropyRange() throws -> Range<Int> {
         // The segment is a verbatim slice (stuffed pairs and RST markers stay
         // in; `BitReader` unstuffs), so only the END needs finding: scan to the
         // first 0xFF whose successor is neither 0x00 (stuffing) nor 0xD0–0xD7
@@ -474,9 +531,13 @@ struct MarkerReader {
         let n = data.count
         let start = offset
         var pos = offset
-        data.withUnsafeBufferPointer { buf in
-            let p = buf.baseAddress!
+        var nextCheckpoint = pos
+        try data.withUnsafeBytes { p in
             while pos < n {
+                if callerStorage != nil, pos >= nextCheckpoint {
+                    try Task.checkCancellation()
+                    nextCheckpoint = pos > Int.max - 65_536 ? Int.max : pos + 65_536
+                }
                 if p[pos] != 0xFF { pos += 1; continue }
                 guard pos + 1 < n else { break }              // trailing lone 0xFF
                 let next = p[pos + 1]
@@ -488,12 +549,20 @@ struct MarkerReader {
             }
         }
         offset = pos
-        return Array(data[start..<pos])
+        return start..<pos
     }
 
     // MARK: - Byte Reading Primitives
 
+    private mutating func checkCancellation() throws {
+        if callerStorage != nil, offset >= nextCancellationCheckpoint {
+            try Task.checkCancellation()
+            nextCancellationCheckpoint = offset > Int.max - 65_536 ? Int.max : offset + 65_536
+        }
+    }
+
     private mutating func readByte() throws -> UInt8 {
+        try checkCancellation()
         guard offset < data.count else {
             throw JLIError.decodingFailed("Unexpected end of JPEG data")
         }

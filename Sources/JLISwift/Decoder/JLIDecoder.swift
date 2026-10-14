@@ -608,51 +608,9 @@ public struct JLIDecoder: Sendable {
         frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration,
         restartInterval: Int = 0, iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil
     ) throws -> JLIImage {
-        let precision = frame.precision
-        guard (2...16).contains(precision) else {
-            throw JLIError.unsupportedJPEGFeature("lossless precision \(precision)")
-        }
-        // Lossless reconstructs exact integer samples; a float32 request here would
-        // only be a lossy-looking convenience cast and is rejected so callers get
-        // the bit-exact uint path (which already preserves every value exactly).
-        guard configuration.outputPixelFormat != .float32 else {
-            throw JLIError.unsupportedJPEGFeature(
-                "float32 output for lossless (use the bit-exact .uint8/.uint16 output)")
-        }
-        let w = frame.width, h = frame.height
-        guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
-            throw JLIError.decodingFailed("invalid lossless dimensions \(w)×\(h)")
-        }
-        // Decompression-bomb guard: a tiny SOF can declare dimensions whose product
-        // would force a multi-gigabyte plane allocation (an uncatchable OOM trap).
-        // Cap total samples before allocating. See `maxDecodablePixels`.
-        guard w * h <= JLIDecoder.maxDecodablePixels else {
-            throw JLIError.decodingFailed(
-                "lossless image too large: \(w)×\(h) exceeds \(JLIDecoder.maxDecodablePixels)-pixel limit")
-        }
-        let nc = frame.components.count
-        guard nc == 1 || nc == 3 else {
-            throw JLIError.unsupportedJPEGFeature("lossless \(nc)-component (only 1 or 3)")
-        }
-        for c in frame.components where c.horizontalSampling != 1 || c.verticalSampling != 1 {
-            throw JLIError.unsupportedJPEGFeature("subsampled lossless")
-        }
-        guard scans.count == 1, let scan = scans.first,
-              scan.header.components.count == nc else {
-            throw JLIError.unsupportedJPEGFeature("Noninterleaved lossless JPEG scans")
-        }
-        let predictor = scan.header.spectralStart       // 1–7
-        let pt = scan.header.successiveApproxLow         // point transform
-        guard (1...7).contains(predictor) else {
-            throw JLIError.decodingFailed("invalid lossless predictor \(predictor)")
-        }
-        // The point transform shifts the initial predictor by `precision-1-pt`; a
-        // pt ≥ precision yields a negative shift count, which traps at runtime.
-        // T.81 also constrains Pt < P for lossless. Reject out-of-range values
-        // (a 4-bit Al field can carry 0–15) with a thrown error, never a trap.
-        guard pt >= 0, pt < precision else {
-            throw JLIError.decodingFailed("invalid lossless point transform \(pt) for precision \(precision)")
-        }
+        let plan = try Self.losslessParameters(frame: frame, scans: scans, configuration: configuration)
+        let precision = frame.precision, w = frame.width, h = frame.height
+        let nc = frame.components.count, predictor = plan.predictor, pt = plan.pointTransform, scan = plan.scan
         let dcTables = prepareDCTables(scan.dcTables)
         let tables = frame.components.map { fc -> HuffmanTable in
             let sc = scan.header.components.first { $0.componentSelector == fc.id }
@@ -829,6 +787,57 @@ public struct JLIDecoder: Sendable {
                             iccProfile: iccProfile, exif: exif)
     }
 
+    internal static func losslessParameters(frame: JPEGFrameInfo, scans: [JPEGScanData],
+                                            configuration: JLIDecoderConfiguration) throws ->
+        (predictor: Int, pointTransform: Int, scan: JPEGScanData) {
+        let precision = frame.precision
+        guard (2...16).contains(precision) else {
+            throw JLIError.unsupportedJPEGFeature("lossless precision \(precision)")
+        }
+        // Lossless reconstructs exact integer samples; a float32 request here would
+        // only be a lossy-looking convenience cast and is rejected so callers get
+        // the bit-exact uint path (which already preserves every value exactly).
+        guard configuration.outputPixelFormat != .float32 else {
+            throw JLIError.unsupportedJPEGFeature(
+                "float32 output for lossless (use the bit-exact .uint8/.uint16 output)")
+        }
+        let w = frame.width, h = frame.height
+        guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
+            throw JLIError.decodingFailed("invalid lossless dimensions \(w)×\(h)")
+        }
+        // Decompression-bomb guard: a tiny SOF can declare dimensions whose product
+        // would force a multi-gigabyte plane allocation (an uncatchable OOM trap).
+        // Cap total samples before allocating. See `maxDecodablePixels`.
+        guard w * h <= JLIDecoder.maxDecodablePixels else {
+            throw JLIError.decodingFailed(
+                "lossless image too large: \(w)×\(h) exceeds \(JLIDecoder.maxDecodablePixels)-pixel limit")
+        }
+        let nc = frame.components.count
+        guard nc == 1 || nc == 3 else {
+            throw JLIError.unsupportedJPEGFeature("lossless \(nc)-component (only 1 or 3)")
+        }
+        for c in frame.components where c.horizontalSampling != 1 || c.verticalSampling != 1 {
+            throw JLIError.unsupportedJPEGFeature("subsampled lossless")
+        }
+        guard scans.count == 1, let scan = scans.first,
+              scan.header.components.count == nc else {
+            throw JLIError.unsupportedJPEGFeature("Noninterleaved lossless JPEG scans")
+        }
+        let predictor = scan.header.spectralStart       // 1–7
+        let pt = scan.header.successiveApproxLow         // point transform
+        guard (1...7).contains(predictor) else {
+            throw JLIError.decodingFailed("invalid lossless predictor \(predictor)")
+        }
+        // The point transform shifts the initial predictor by `precision-1-pt`; a
+        // pt ≥ precision yields a negative shift count, which traps at runtime.
+        // T.81 also constrains Pt < P for lossless. Reject out-of-range values
+        // (a 4-bit Al field can carry 0–15) with a thrown error, never a trap.
+        guard pt >= 0, pt < precision else {
+            throw JLIError.decodingFailed("invalid lossless point transform \(pt) for precision \(precision)")
+        }
+        return (predictor, pt, scan)
+    }
+
     /// Minimum block count before Step-7 reconstruction fans out across cores;
     /// below a few thousand blocks the dispatch overhead wins. Lock-protected
     /// because the serial/parallel equality tests mutate it while other tests
@@ -862,7 +871,7 @@ public struct JLIDecoder: Sendable {
     /// `@unchecked Sendable` carrier for parallel Step-7 reconstruction: each
     /// worker reads the shared `zz`/`qt` and writes only its own block range's
     /// subranges of `px`/`scratch` plus the disjoint plane tiles of its blocks.
-    private struct ReconstructPtrs: @unchecked Sendable {
+    internal struct ReconstructPtrs: @unchecked Sendable {
         let zz: UnsafePointer<Int32>
         let qt: UnsafePointer<Float>
         let px: UnsafeMutablePointer<Float>
@@ -875,9 +884,9 @@ public struct JLIDecoder: Sendable {
     /// shift + clamp, then a per-row memcpy scatter of each block's in-bounds
     /// region into the component-sized plane. Callable on any disjoint block
     /// range; block tiles never overlap, so partitioning is race-free.
-    private static func reconstructBlocks(
+    internal static func reconstructBlocks(
         _ blocks: Range<Int>, ptrs: ReconstructPtrs, blocksH: Int,
-        compWidth: Int, compHeight: Int, precision: Int
+        compWidth: Int, compHeight: Int, precision: Int, firstBlockRow: Int = 0
     ) {
         let m = blocks.count
         guard m > 0 else { return }
@@ -898,7 +907,7 @@ public struct JLIDecoder: Sendable {
         for bi in 0..<m {
             let b = base + bi
             let startX = (b % blocksH) * 8
-            let startY = (b / blocksH) * 8
+            let startY = (firstBlockRow + b / blocksH) * 8
             // MCU geometry can pad subsampled components past the component's
             // actual extent (e.g. a 4:2:0 luma grid rounded up to even blocks on
             // a tiny image) — such blocks decode but land entirely outside the
@@ -922,10 +931,19 @@ public struct JLIDecoder: Sendable {
     /// Huffman category + magnitude bits, accumulate modulo 2^16 (T.81) in the
     /// point-transformed domain, write through the raw plane pointer.
     private static func losslessScanGray(
-        _ p: UnsafeMutablePointer<Int32>, width w: Int, height h: Int,
+        _ p: UnsafeMutablePointer<Int32>, width: Int, height: Int,
         predictor: Int, half: Int32, table: HuffmanTable, reader: inout BitReader
     ) throws {
+        try losslessScanGrayInto(LosslessInt32Samples(pointer: p), width: width, height: height,
+            predictor: predictor, half: half, table: table, reader: &reader)
+    }
+
+    internal static func losslessScanGrayInto<Table: HuffmanDecodeTable, Samples: LosslessSampleStorage>(
+        _ p: Samples, width w: Int, height h: Int,
+        predictor: Int, half: Int32, table: Table, reader: inout BitReader, cancellable: Bool = false
+    ) throws {
         for y in 0..<h {
+            if cancellable { try Task.checkCancellation() }
             let row = y * w, prevRow = row - w
             for x in 0..<w {
                 let px: Int32
@@ -1080,7 +1098,7 @@ public struct JLIDecoder: Sendable {
     /// Rejects structurally-invalid frames that the decode pipeline cannot
     /// handle without trapping — malformed input (e.g. JPEG-in-DICOM from an
     /// untrusted source) must fail with a thrown ``JLIError``, never a crash.
-    private func validateDecodable(_ frame: JPEGFrameInfo, quantTableCount: Int) throws {
+    internal func validateDecodable(_ frame: JPEGFrameInfo, quantTableCount: Int) throws {
         // Precision drives the level shift `1 << (precision-1)`, which traps for
         // precision 0; we only decode 8-bit (color/gray) and 12-bit (gray).
         guard frame.precision == 8 || frame.precision == 12 else {

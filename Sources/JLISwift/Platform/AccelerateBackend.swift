@@ -356,26 +356,34 @@ enum AccelerateDSP {
         y: [Float], cb: [Float], cr: [Float], pixelCount: Int
     ) -> [UInt8] {
         precondition(y.count == pixelCount && cb.count == pixelCount && cr.count == pixelCount)
-        let n = vDSP_Length(pixelCount)
-
-        // One uninitialized scratch block (cbS, crS, r, g, b) + raw pointers so
-        // the in-place `g` updates don't trip copy-on-write, and no buffer is
-        // zero-filled before vDSP overwrites it. Output allocated uninitialized
-        // (the 3 strided vDSP_vfixru8 cover every byte). Byte-identical math.
         let scratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: pixelCount * 5)
-        defer { scratch.deallocate() }
-        let cbS = scratch.baseAddress!
-        let crS = cbS + pixelCount, r = cbS + pixelCount * 2
-        let g = cbS + pixelCount * 3, b = cbS + pixelCount * 4
+        let planes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: pixelCount * 3)
+        defer { scratch.deallocate(); planes.deallocate() }
+        return y.withUnsafeBufferPointer { yp in
+            cb.withUnsafeBufferPointer { cp in
+                cr.withUnsafeBufferPointer { rp in
+                    [UInt8](unsafeUninitializedCapacity: pixelCount * 3) { output, initialized in
+                        imageYCbCrToRGB(y: yp.baseAddress!, cb: cp.baseAddress!, cr: rp.baseAddress!,
+                            pixelCount: pixelCount, scratch: scratch.baseAddress!, planes: planes.baseAddress!,
+                            output: UnsafeMutableRawPointer(output.baseAddress!))
+                        initialized = pixelCount * 3
+                    }
+                }
+            }
+        }
+    }
 
+    /// Canonical conversion with supplied five-Float/three-byte-plane scratch.
+    /// Supports tiled conversion with identical operation order and rounding.
+    static func imageYCbCrToRGB(y yb: UnsafePointer<Float>, cb cbb: UnsafePointer<Float>,
+        cr crb: UnsafePointer<Float>, pixelCount: Int, scratch: UnsafeMutablePointer<Float>,
+        planes: UnsafeMutablePointer<UInt8>, output: UnsafeMutableRawPointer) {
+        let n = vDSP_Length(pixelCount)
+        let cbS = scratch, crS = scratch + pixelCount, r = scratch + pixelCount * 2
+        let g = scratch + pixelCount * 3, b = scratch + pixelCount * 4
         var neg128: Float = -128.0
         var rCr: Float = 1.402, gCb: Float = -0.344136, gCr: Float = -0.714136, bCb: Float = 1.772
         var lo: Float = 0.0, hi: Float = 255.0
-
-        return y.withUnsafeBufferPointer { yp in
-            cb.withUnsafeBufferPointer { cbp in
-                cr.withUnsafeBufferPointer { crp in
-                    let yb = yp.baseAddress!, cbb = cbp.baseAddress!, crb = crp.baseAddress!
                     vDSP_vsadd(cbb, 1, &neg128, cbS, 1, n)
                     vDSP_vsadd(crb, 1, &neg128, crS, 1, n)
                     // R = Y + 1.402 Cr',  G = Y - 0.344136 Cb' - 0.714136 Cr',  B = Y + 1.772 Cb'
@@ -387,35 +395,13 @@ enum AccelerateDSP {
                     vDSP_vclip(r, 1, &lo, &hi, r, 1, n)
                     vDSP_vclip(g, 1, &lo, &hi, g, 1, n)
                     vDSP_vclip(b, 1, &lo, &hi, b, 1, n)
-                    // vDSP_vfixru8 rounds to nearest (ties to even), matching the
-                    // scalar `Int(value.rounded())` semantics. The strided form of
-                    // these three stores was the single biggest decode stage
-                    // (~31% wall, half of it in vfixru8 alone): each pass touched
-                    // one byte in 3 across the whole image. Convert stride-1 into
-                    // contiguous byte planes instead (identical rounding — only
-                    // the addressing changes) and interleave with one vImage pass
-                    // (pure byte movement) → byte-identical output.
-                    let planes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: pixelCount * 3)
-                    defer { planes.deallocate() }
-                    let pr = planes.baseAddress!, pg = pr + pixelCount, pb = pr + pixelCount * 2
-                    vDSP_vfixru8(r, 1, pr, 1, n)
-                    vDSP_vfixru8(g, 1, pg, 1, n)
-                    vDSP_vfixru8(b, 1, pb, 1, n)
-                    return [UInt8](unsafeUninitializedCapacity: pixelCount * 3) { buf, cnt in
-                        var sR = vImage_Buffer(data: pr, height: 1,
-                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-                        var sG = vImage_Buffer(data: pg, height: 1,
-                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-                        var sB = vImage_Buffer(data: pb, height: 1,
-                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
-                        var dst = vImage_Buffer(data: buf.baseAddress!, height: 1,
-                                                width: vImagePixelCount(pixelCount), rowBytes: pixelCount * 3)
-                        vImageConvert_Planar8toRGB888(&sR, &sG, &sB, &dst, vImage_Flags(kvImageNoFlags))
-                        cnt = pixelCount * 3
-                    }
-                }
-            }
-        }
+        let pr = planes, pg = pr + pixelCount, pb = pr + pixelCount * 2
+        vDSP_vfixru8(r, 1, pr, 1, n); vDSP_vfixru8(g, 1, pg, 1, n); vDSP_vfixru8(b, 1, pb, 1, n)
+        var sR = vImage_Buffer(data: pr, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+        var sG = vImage_Buffer(data: pg, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+        var sB = vImage_Buffer(data: pb, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+        var dst = vImage_Buffer(data: output, height: 1, width: vImagePixelCount(pixelCount), rowBytes: pixelCount * 3)
+        vImageConvert_Planar8toRGB888(&sR, &sG, &sB, &dst, vImage_Flags(kvImageNoFlags))
     }
 
     // MARK: - 16-bit (12-bit precision) color conversion
