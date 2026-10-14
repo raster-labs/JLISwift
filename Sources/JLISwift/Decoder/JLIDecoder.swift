@@ -59,10 +59,33 @@ public struct JLIDecoder: Sendable {
             throw JLIError.invalidJPEGData
         }
 
+        guard data.count <= configuration.maximumEncodedBytes else {
+            throw JLIError.decodingFailed("JPEG exceeds encoded byte limit")
+        }
+
         // Step 1: Parse JPEG markers
         var markerReader = MarkerReader(data: data)
         let parsed = try markerReader.parse()
         let frame = parsed.frameInfo
+        let (pixels, pixelOverflow) = frame.width.multipliedReportingOverflow(by: frame.height)
+        let (samples, sampleOverflow) = pixels.multipliedReportingOverflow(by: frame.components.count)
+        let bytesPerSample = configuration.outputPixelFormat == .float32 ? 4 : (frame.precision > 8 ? 2 : 1)
+        let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: bytesPerSample)
+        guard frame.width > 0, frame.height > 0, !pixelOverflow, !sampleOverflow, !byteOverflow,
+              pixels <= configuration.maximumPixels, bytes <= configuration.maximumDecodedBytes else {
+            throw JLIError.decodingFailed("JPEG exceeds decoded pixel/byte limit")
+        }
+        if let source = configuration.sourceColorModel,
+           source != .rgb && source != .yCbCr {
+            throw JLIError.unsupportedJPEGFeature("Unsupported JPEG source color interpretation")
+        }
+        // A requested color model must describe real output, not merely relabel it.
+        if !frame.isLossless, let requested = configuration.outputColorModel {
+            let actual: JLIColorModel = frame.components.count == 1 ? .grayscale : .rgb
+            guard requested == actual else {
+                throw JLIError.unsupportedJPEGFeature("Requested color conversion is not implemented")
+            }
+        }
 
         guard !parsed.scans.isEmpty else {
             throw JLIError.decodingFailed("No scan data found in JPEG")
@@ -437,6 +460,33 @@ public struct JLIDecoder: Sendable {
                 outputData = plane.data.map { UInt8(clamping: Int($0.rounded())) }
             }
             outputColorModel = configuration.outputColorModel ?? .grayscale
+        } else if numComponents == 3 && parsed.iccProfile != XYBICCProfile.data
+                    && (configuration.sourceColorModel == .rgb
+                    || (configuration.sourceColorModel == nil && (parsed.adobeTransform == 0
+                        || components.map(\.id) == [82, 71, 66]))) {
+            let planes = componentPlanes.map { plane in
+                ChromaSampling.upsample(plane.data, width: plane.width, height: plane.height,
+                                        targetWidth: outW, targetHeight: outH)
+            }
+            if wantsFloat32 {
+                var values = [Float](repeating: 0, count: outW * outH * 3)
+                for i in 0..<(outW * outH) {
+                    for c in 0..<3 { values[i * 3 + c] = planes[c][i] }
+                }
+                outputData = Self.floatsToLE(values)
+            } else {
+                var bytes: [UInt8] = []
+                bytes.reserveCapacity(outW * outH * 3 * (isExtendedPrecision ? 2 : 1))
+                for i in 0..<(outW * outH) {
+                    for c in 0..<3 {
+                        let value = UInt16(clamping: Int(planes[c][i].rounded()))
+                        if isExtendedPrecision { bytes.append(UInt8(value & 255)); bytes.append(UInt8(value >> 8)) }
+                        else { bytes.append(UInt8(clamping: value)) }
+                    }
+                }
+                outputData = bytes
+            }
+            outputColorModel = .rgb
         } else if numComponents == 3 && !isExtendedPrecision
                     && parsed.iccProfile == XYBICCProfile.data {
             // XYB color: the three full-resolution planes are scaled-XYB samples
@@ -479,19 +529,26 @@ public struct JLIDecoder: Sendable {
             }
             let yPlane = componentPlanes[0]
 
-            // Upsample Cb and Cr to full resolution
-            let cbUp = ChromaSampling.upsample(
-                componentPlanes[1].data,
-                width: componentPlanes[1].width,
-                height: componentPlanes[1].height,
-                targetWidth: outW, targetHeight: outH
-            )
-            let crUp = ChromaSampling.upsample(
-                componentPlanes[2].data,
-                width: componentPlanes[2].width,
-                height: componentPlanes[2].height,
-                targetWidth: outW, targetHeight: outH
-            )
+            // Full-resolution integer output reconstructs centered JPEG chroma
+            // using SOF sampling factors. Reduced-scale box-average previews
+            // retain their existing floating-point reconstruction.
+            func upsampleChroma(_ index: Int) -> [Float] {
+                let plane = componentPlanes[index]
+                if scale == 1 {
+                    return ChromaSampling.upsampleJPEG(
+                        plane.data, width: plane.width, height: plane.height,
+                        targetWidth: outW, targetHeight: outH,
+                        horizontalSampling: components[index].horizontalSampling,
+                        verticalSampling: components[index].verticalSampling,
+                        maximumHorizontalSampling: hMaxSampling,
+                        maximumVerticalSampling: vMaxSampling)
+                }
+                return ChromaSampling.upsample(
+                    plane.data, width: plane.width, height: plane.height,
+                    targetWidth: outW, targetHeight: outH)
+            }
+            let cbUp = upsampleChroma(1)
+            let crUp = upsampleChroma(2)
 
             // Trim Y plane if padded
             let yTrimmed: [Float]
@@ -499,12 +556,13 @@ public struct JLIDecoder: Sendable {
                 var trimmed = [Float](repeating: 0, count: outW * outH)
                 for y in 0..<outH {
                     for x in 0..<outW {
-                        trimmed[y * outW + x] = yPlane.data[y * yPlane.width + x]
+                        let sample = yPlane.data[y * yPlane.width + x]
+                        trimmed[y * outW + x] = scale == 1 ? sample.rounded() : sample
                     }
                 }
                 yTrimmed = trimmed
             } else {
-                yTrimmed = yPlane.data
+                yTrimmed = scale == 1 ? yPlane.data.map { $0.rounded() } : yPlane.data
             }
 
             if isExtendedPrecision {
@@ -580,7 +638,10 @@ public struct JLIDecoder: Sendable {
         for c in frame.components where c.horizontalSampling != 1 || c.verticalSampling != 1 {
             throw JLIError.unsupportedJPEGFeature("subsampled lossless")
         }
-        guard let scan = scans.first else { throw JLIError.decodingFailed("no lossless scan") }
+        guard scans.count == 1, let scan = scans.first,
+              scan.header.components.count == nc else {
+            throw JLIError.unsupportedJPEGFeature("Noninterleaved lossless JPEG scans")
+        }
         let predictor = scan.header.spectralStart       // 1–7
         let pt = scan.header.successiveApproxLow         // point transform
         guard (1...7).contains(predictor) else {

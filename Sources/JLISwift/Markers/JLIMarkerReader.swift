@@ -63,6 +63,8 @@ struct ParsedJPEG: Sendable {
     let iccProfile: [UInt8]?
     /// Exif payload (APP1 body after the `Exif\0\0` identifier), or nil.
     let exif: [UInt8]?
+    /// Adobe APP14 transform: zero denotes untransformed RGB for three components.
+    var adobeTransform: UInt8? = nil
 }
 
 // MARK: - Marker Reader
@@ -130,6 +132,8 @@ struct MarkerReader {
     mutating func parse() throws -> ParsedJPEG {
         try validateSOI()
 
+        var sawEOI = false
+        var adobeTransform: UInt8?
         var frameInfo: JPEGFrameInfo?
         var quantTables = [[Int]](repeating: [Int](repeating: 0, count: 64), count: 4)
         var huffDC = [Int: HuffmanTable]()
@@ -139,13 +143,14 @@ struct MarkerReader {
         var exifData: [UInt8]? = nil
         var iccChunks: [Int: [UInt8]] = [:]   // sequence number → chunk payload
 
-        while offset < data.count - 1 {
+        markers: while offset < data.count - 1 {
             guard let marker = try nextMarker() else { break }
 
             switch marker {
             case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2, JPEGMarker.sof3:
                 // SOF0 baseline + SOF1 extended sequential decode identically
                 // (both Huffman sequential); SOF1 just permits 12-bit precision.
+                guard frameInfo == nil else { throw JLIError.decodingFailed("Multiple SOF markers") }
                 frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2,
                                         lossless: marker == JPEGMarker.sof3)
 
@@ -180,7 +185,17 @@ struct MarkerReader {
                 ))
 
             case JPEGMarker.eoi:
-                break
+                sawEOI = true
+                guard offset == data.count || (offset % 2 == 1 && offset + 1 == data.count && data[offset] == 0) else {
+                    throw JLIError.decodingFailed("Trailing bytes or concatenated JPEG codestream")
+                }
+                break markers
+
+            case 0xee:
+                let segment = try readSegmentBytes()
+                if segment.count >= 12 && Array(segment.prefix(5)) == [65, 100, 111, 98, 101] {
+                    adobeTransform = segment[11]
+                }
 
             case JPEGMarker.app1:
                 // Exif: "Exif\0\0" identifier then the TIFF payload we preserve.
@@ -213,6 +228,8 @@ struct MarkerReader {
             }
         }
 
+        guard sawEOI else { throw JLIError.decodingFailed("Missing JPEG EOI marker") }
+
         // Reassemble the ICC profile from its chunks in sequence order. Only
         // accept a contiguous 1..n run so a malformed/partial set yields nil
         // rather than a silently-corrupt profile.
@@ -236,7 +253,7 @@ struct MarkerReader {
             scans: scans,
             restartInterval: restartInterval,
             iccProfile: iccProfile,
-            exif: exifData
+            exif: exifData, adobeTransform: adobeTransform
         )
     }
 
