@@ -583,7 +583,8 @@ public struct JLIEncoder: Sendable {
     /// decoders treat it as RGB, matching libjpeg-turbo's lossless).
     private func encodeLossless(
         _ image: JLIImage, configuration: JLIEncoderConfiguration,
-        precision: Int, isGrayscale: Bool
+        precision: Int, isGrayscale: Bool,
+        borrowedSource: BorrowedSamplePlane? = nil
     ) throws -> [UInt8] {
         let predictor = configuration.losslessPredictor
         guard (1...7).contains(predictor) else {
@@ -631,18 +632,29 @@ public struct JLIEncoder: Sendable {
         let planeStore = UnsafeMutableBufferPointer<Int32>.allocate(capacity: count * nc)
         defer { planeStore.deallocate() }
         let planeBase = planeStore.baseAddress!
-        image.data.withUnsafeBufferPointer { src in
-            let s = src.baseAddress!
-            for c in 0..<nc {
-                let p = planeBase + c * count
-                if bps == 1 {
-                    for i in 0..<count { p[i] = Int32(s[i * srcCC + c]) >> pt }
-                } else {
-                    for i in 0..<count {
-                        let o = (i * srcCC + c) * 2
-                        p[i] = Int32(UInt16(s[o]) | (UInt16(s[o + 1]) << 8)) >> pt
-                    }
-                }
+        // One de-interleave loop, whichever plane the samples are in. The
+        // borrowed branch honours the caller's row stride and never reads the
+        // padding between the row payload and `rowBytes`, so padding cannot
+        // reach the codestream.
+        if let borrowed = borrowedSource {
+            let rowSamples = borrowed.rowBytes / bps
+            guard borrowed.bytes.count >= (h - 1) * borrowed.rowBytes + w * bps * srcCC else {
+                throw JLIError.bufferSizeMismatch(
+                    expected: (h - 1) * borrowed.rowBytes + w * bps * srcCC,
+                    actual: borrowed.bytes.count)
+            }
+            jliReadInterleavedPlanes(
+                from: borrowed.bytes, into: planeBase, width: w, height: h,
+                rowSamples: rowSamples, componentCount: nc,
+                sourceComponentCount: srcCC, samplesPerPlane: count,
+                bytesPerSample: bps, pointTransform: pt)
+        } else {
+            image.data.withUnsafeBufferPointer { src in
+                jliReadInterleavedPlanes(
+                    from: UnsafeRawBufferPointer(src), into: planeBase,
+                    width: w, height: h, rowSamples: w * srcCC, componentCount: nc,
+                    sourceComponentCount: srcCC, samplesPerPlane: count,
+                    bytesPerSample: bps, pointTransform: pt)
             }
         }
 
@@ -1573,5 +1585,57 @@ public struct JLIEncoder: Sendable {
             result[i] = UInt8(clamping: table[Quantization.zigzagOrder[i]])
         }
         return result
+    }
+}
+
+
+// MARK: - Shared-storage entry for the contract surface
+
+extension JLIEncoder {
+    /// Encode a lossless greyscale frame reading samples out of `plane`.
+    /// Synchronous throughout, so the borrow cannot outlive the caller's
+    /// storage lease.
+    func encodeLosslessGreyscale(
+        from plane: BorrowedSamplePlane, width: Int, height: Int,
+        precision: Int, configuration: JLIEncoderConfiguration
+    ) throws -> [UInt8] {
+        try validateConfiguration(configuration)
+        guard configuration.lossless else {
+            throw JLIError.unsupportedJPEGFeature("the shared surface encodes the lossless SOF3 path only")
+        }
+        let image = try JLIImage(geometryOnlyWidth: width, height: height,
+                                 pixelFormat: precision <= 8 ? .uint8 : .uint16,
+                                 colorModel: .grayscale)
+        return try encodeLossless(image, configuration: configuration,
+                                  precision: precision, isGrayscale: true,
+                                  borrowedSource: plane)
+    }
+}
+
+/// The one de-interleave path, used by both the array and borrowed branches so
+/// they cannot drift.
+@inline(__always)
+func jliReadInterleavedPlanes(
+    from src: UnsafeRawBufferPointer,
+    into planeBase: UnsafeMutablePointer<Int32>,
+    width: Int, height: Int, rowSamples: Int,
+    componentCount nc: Int, sourceComponentCount srcCC: Int,
+    samplesPerPlane count: Int, bytesPerSample bps: Int, pointTransform pt: Int
+) {
+    guard let s = src.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+    for c in 0..<nc {
+        let p = planeBase + c * count
+        for y in 0..<height {
+            let rowBase = y &* rowSamples
+            let out = y &* width
+            if bps == 1 {
+                for x in 0..<width { p[out &+ x] = Int32(s[rowBase &+ x &* srcCC &+ c]) >> pt }
+            } else {
+                for x in 0..<width {
+                    let o = (rowBase &+ x &* srcCC &+ c) &* 2
+                    p[out &+ x] = Int32(UInt16(s[o]) | (UInt16(s[o &+ 1]) << 8)) >> pt
+                }
+            }
+        }
     }
 }

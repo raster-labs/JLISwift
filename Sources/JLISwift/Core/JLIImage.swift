@@ -148,4 +148,36 @@ public struct JLIImage: Sendable {
         self.iccProfile = iccProfile
         self.exif = exif
     }
+
+    /// Geometry without samples, for the shared-storage paths.
+    ///
+    /// The public initialiser requires `data.count` to equal the packed frame
+    /// size exactly. That invariant is what puts `CopyPolicy.requireSharedStorage`
+    /// out of reach through the public type: a caller holding their own padded
+    /// plane cannot describe an image without first copying the plane into an
+    /// array, and that copy is the hand-off the policy excludes. The shared
+    /// paths carry the samples in the caller's allocation instead, so the
+    /// descriptor here is deliberately empty and `data` stays empty for the
+    /// image's whole life.
+    init(
+        geometryOnlyWidth width: Int,
+        height: Int,
+        pixelFormat: JLIPixelFormat,
+        colorModel: JLIColorModel,
+        isSigned: Bool = false,
+        iccProfile: [UInt8]? = nil,
+        exif: [UInt8]? = nil
+    ) throws {
+        guard width > 0, height > 0 else {
+            throw JLIError.invalidImageDimensions(width: width, height: height)
+        }
+        self.width = width
+        self.height = height
+        self.pixelFormat = pixelFormat
+        self.colorModel = colorModel
+        self.isSigned = isSigned
+        self.data = []
+        self.iccProfile = iccProfile
+        self.exif = exif
+    }
 }

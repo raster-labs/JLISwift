@@ -606,7 +606,8 @@ public struct JLIDecoder: Sendable {
     /// stored directly — no color transform, like libjpeg-turbo's lossless).
     private func decodeLossless(
         frame: JPEGFrameInfo, scans: JPEGStorageArray<JPEGScanData>, configuration: JLIDecoderConfiguration,
-        restartInterval: Int = 0, iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil
+        restartInterval: Int = 0, iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil,
+        borrowedDestination: BorrowedSampleDestination? = nil
     ) throws -> JLIImage {
         let plan = try Self.losslessParameters(frame: frame, scans: scans, configuration: configuration)
         let precision = frame.precision, w = frame.width, h = frame.height
@@ -755,34 +756,38 @@ public struct JLIDecoder: Sendable {
         // written); the inverse point-transform shift and clamping semantics
         // are unchanged.
         let model = configuration.outputColorModel ?? (nc == 1 ? .grayscale : .rgb)
-        if precision <= 8 {
-            var bytes = [UInt8](unsafeUninitializedCapacity: count * nc) { _, n in n = count * nc }
-            bytes.withUnsafeMutableBufferPointer { bp in
-                for c in 0..<nc {
-                    let src = base + c * count
-                    let dst = bp.baseAddress! + c
-                    for i in 0..<count { dst[i * nc] = UInt8(clamping: Int(src[i]) << pt) }
-                }
+        let bps = precision <= 8 ? 1 : 2
+        let outputFormat = configuration.outputPixelFormat ?? (bps == 1 ? .uint8 : .uint16)
+
+        // One interleave path, whichever plane the samples go to. The borrowed
+        // branch honours the caller's row stride and never writes the padding
+        // between the row payload and `rowBytes`, so caller sentinels survive.
+        if let borrowed = borrowedDestination {
+            let needed = (h - 1) * borrowed.rowBytes + w * nc * bps
+            guard borrowed.bytes.count >= needed else {
+                throw JLIError.bufferSizeMismatch(expected: needed, actual: borrowed.bytes.count)
             }
-            return try JLIImage(width: w, height: h,
-                                pixelFormat: configuration.outputPixelFormat ?? .uint8,
-                                colorModel: model, data: bytes,
-                                iccProfile: iccProfile, exif: exif)
+            jliWriteInterleavedPlanes(
+                from: base, into: borrowed.bytes, width: w, height: h,
+                rowSamples: borrowed.rowBytes / bps, componentCount: nc,
+                samplesPerPlane: count, bytesPerSample: bps, pointTransform: pt)
+            // Geometry only: the samples are in the caller's allocation, and
+            // MEM-12 says a relabelled final image is not workspace, so none
+            // is produced here.
+            return try JLIImage(geometryOnlyWidth: w, height: h, pixelFormat: outputFormat,
+                                colorModel: model, iccProfile: iccProfile, exif: exif)
         }
-        var bytes = [UInt8](unsafeUninitializedCapacity: count * nc * 2) { _, n in n = count * nc * 2 }
+
+        var bytes = [UInt8](unsafeUninitializedCapacity: count * nc * bps) { _, n in
+            n = count * nc * bps
+        }
         bytes.withUnsafeMutableBufferPointer { bp in
-            for c in 0..<nc {
-                let src = base + c * count
-                let dst = bp.baseAddress! + c * 2
-                for i in 0..<count {
-                    let v = UInt16(clamping: Int(src[i]) << pt)
-                    dst[i * nc * 2] = UInt8(v & 0xFF)
-                    dst[i * nc * 2 + 1] = UInt8(v >> 8)
-                }
-            }
+            jliWriteInterleavedPlanes(
+                from: base, into: UnsafeMutableRawBufferPointer(bp), width: w, height: h,
+                rowSamples: w * nc, componentCount: nc, samplesPerPlane: count,
+                bytesPerSample: bps, pointTransform: pt)
         }
-        return try JLIImage(width: w, height: h,
-                            pixelFormat: configuration.outputPixelFormat ?? .uint16,
+        return try JLIImage(width: w, height: h, pixelFormat: outputFormat,
                             colorModel: model, data: bytes,
                             iccProfile: iccProfile, exif: exif)
     }
@@ -1162,5 +1167,68 @@ public struct JLIDecoder: Sendable {
             }
         }
         return .success(())
+    }
+}
+
+
+// MARK: - Shared-storage entry for the contract surface
+
+extension JLIDecoder {
+    /// Decode a lossless greyscale JPEG writing final samples into `plane`.
+    /// Synchronous throughout, so the borrow cannot outlive the caller's
+    /// storage lease.
+    func decodeLosslessGreyscale(
+        from data: [UInt8], into plane: BorrowedSampleDestination,
+        configuration: JLIDecoderConfiguration
+    ) throws -> JLIImage {
+        guard data.count >= 2, data[0] == 0xFF, data[1] == 0xD8 else {
+            throw JLIError.invalidJPEGData
+        }
+        var markerReader = MarkerReader(data: data)
+        let parsed = try markerReader.parse()
+        let frame = parsed.frameInfo
+        guard !parsed.scans.isEmpty else {
+            throw JLIError.decodingFailed("No scan data found in JPEG")
+        }
+        guard frame.isLossless else {
+            throw JLIError.unsupportedJPEGFeature("the shared surface decodes the lossless SOF3 path only")
+        }
+        return try decodeLossless(
+            frame: frame, scans: parsed.scans, configuration: configuration,
+            restartInterval: parsed.restartInterval,
+            iccProfile: parsed.iccProfile, exif: parsed.exif,
+            borrowedDestination: plane)
+    }
+}
+
+/// The one interleave path, used by both the array and borrowed branches so
+/// they cannot drift.
+@inline(__always)
+func jliWriteInterleavedPlanes(
+    from planeBase: UnsafePointer<Int32>,
+    into dst: UnsafeMutableRawBufferPointer,
+    width: Int, height: Int, rowSamples: Int,
+    componentCount nc: Int, samplesPerPlane count: Int,
+    bytesPerSample bps: Int, pointTransform pt: Int
+) {
+    guard let d = dst.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+    for c in 0..<nc {
+        let src = planeBase + c * count
+        for y in 0..<height {
+            let rowBase = y &* rowSamples
+            let inRow = y &* width
+            if bps == 1 {
+                for x in 0..<width {
+                    d[rowBase &+ x &* nc &+ c] = UInt8(clamping: Int(src[inRow &+ x]) << pt)
+                }
+            } else {
+                for x in 0..<width {
+                    let v = UInt16(clamping: Int(src[inRow &+ x]) << pt)
+                    let o = (rowBase &+ x &* nc &+ c) &* 2
+                    d[o] = UInt8(v & 0xFF)
+                    d[o &+ 1] = UInt8(v >> 8)
+                }
+            }
+        }
     }
 }
