@@ -1,16 +1,19 @@
 # Caller-owned decode storage
 
-Local candidate based on JLISwift 0.5.2. Existing owned decode APIs remain available.
-This is a payload-capacity API, not a complete Swift/Accelerate heap bound.
+The 0.6.0 core APIs return nonthrowing `JLICoreOutcome` values. They use supplied
+input, workspace and output with concrete parser control records and shared
+numerical kernels. Existing throwing decode APIs remain compatibility adapters.
+Complete allocation qualification also requires the recorded compiler/runtime
+profile, admitted caller stack/control storage and a qualified cancellation callback.
 
-`inspectLosslessMonochrome` and `decodeLosslessMonochrome` reuse the canonical marker,
+`inspectLosslessMonochromeCore` and `decodeLosslessMonochromeCore` reuse the canonical marker,
 Huffman and lossless prediction implementations with borrowed input and fixed caller
 scratch. Output is unsigned little-endian UInt16. A caller may interpret signed
 DICOM containers under its existing descriptor rules. Predictor, restart and
 point-transform semantics are retained. No encoded copy or full Int32 plane is
 required. This additive profile supports one monochrome SOF3 scan.
 
-`inspectBaselineRGB` and `decodeBaselineRGB` support full-resolution sequential
+`inspectBaselineRGBCore` and `decodeBaselineRGBCore` support full-resolution sequential
 8-bit three-component JPEG. The caller supplies an aligned raw arena of 12 bytes
 per pixel and the reported workspace. Output occupies only the first 3 bytes per
 pixel, but the full arena must remain retained and charged. Never account it as a
@@ -31,10 +34,17 @@ Sequential separate/mixed component scans snapshot DHT, DQT and DRI state at SOS
 This corrects the legacy owned baseline path's first-scan-only behavior; do not
 claim parity with that behavior for multi-scan images. Undersampled luminance and
 XYB planes use generic expansion, replacing previously unsafe full-size indexing.
-Malformed cumulative DC overflow throws. Legacy normal images preserve their
+Malformed cumulative DC overflow returns a scalar failure. Legacy normal images preserve their
 canonical reconstruction and conversion math.
 
 Tests cover independent lossless fixtures, all predictors, point transforms,
 restarts, odd dimensions, color modes, scan-state changes, malformed coefficients,
-exact capacities, overlap, canaries and cancellation. Fixed lazy ICC/DCT data and
-Swift/parser/control allocations remain outside the reported payload capacity.
+exact capacities, overlap, canaries and cancellation. The core uses fixed scalar/SIMD kernels and supplied reconstruction tables instead
+of opaque Accelerate scratch. Internal concrete result carriers avoid cold generic
+metadata initialization on the selected compiled path. Runtime and final caller
+qualification are separate from source-level tests and explicit buffer capacities.
+
+The shared image-contract APIs (`JLIContractCodec`, `Image`, `ImageDestination`)
+remain available with their existing storage semantics. They use owned parser and
+workspace allocations and are outside this core allocation qualification. Shared
+pixel storage or an `OperationReport` is not evidence of a total operation bound.
