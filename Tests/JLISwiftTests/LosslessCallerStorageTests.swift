@@ -80,6 +80,23 @@ struct LosslessCallerStorageTests {
         replaced.insert(contentsOf: table, at: replaced.count - 2)
         #expect(try decode(replaced) == [0, 136])
     }
+    @Test("Post-scan DRI changes do not reinterpret completed lossless entropy")
+    func restartIntervalSnapshot() throws {
+        let fixtures: [([UInt8], [UInt8])] = [
+            (LosslessTests.llP1, LosslessTests.src.flatMap { [$0, 0] }),
+            (LosslessRestartTests.cjpegRestart8, LosslessRestartTests.expected8.flatMap { [$0, 0] }),
+            (LosslessRestartTests.cjpegRestart12,
+             LosslessRestartTests.expected12.flatMap { [UInt8($0 & 255), UInt8($0 >> 8)] })
+        ]
+        for (encoded, expected) in fixtures {
+            for laterInterval in [UInt8(0), 1, 26] {
+                var redefined = encoded
+                redefined.insert(contentsOf: [0xff, 0xdd, 0, 4, 0, laterInterval], at: redefined.count - 2)
+                #expect(try decode(redefined) == expected)
+            }
+        }
+    }
+
     @Test("Caller capacities, overlapping spans and malformed structures fail")
     func invalidInput() throws {
         let data = oneSample()

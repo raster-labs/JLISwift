@@ -24,6 +24,7 @@ final class JLILosslessParseStorage: JPEGParseCapture {
     private(set) var selected = Descriptor()
     private(set) var selectedID = 0
     private(set) var entropy = 0..<0
+    private(set) var restartInterval = 0
     init(descriptors: UnsafeMutableBufferPointer<Descriptor>) {
         self.descriptors = descriptors
         descriptors.initialize(repeating: Descriptor())
@@ -40,6 +41,7 @@ final class JLILosslessParseStorage: JPEGParseCapture {
         selectedID = selector?.dcTableId ?? 0
         selected = descriptors[selectedID]
         self.entropy = entropy
+        self.restartInterval = restartInterval
     }
 }
 

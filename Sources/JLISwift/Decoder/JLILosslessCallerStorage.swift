@@ -60,7 +60,9 @@ extension JLIDecoder {
             value: { descriptor.count >= 0 ? encoded[descriptor.values + $0] : fallback.value($0) })
         var reader = BitReader(borrowing: UnsafeRawBufferPointer(rebasing: encoded[storage.entropy]))
         let w = info.width, h = info.height
-        let interval = parsed.restartInterval
+        // DRI applies to subsequent scans; a marker after this SOS/entropy span
+        // must not retroactively change the restart topology being decoded.
+        let interval = storage.restartInterval
         guard interval == 0 || interval % w == 0 else {
             throw JLIError.unsupportedJPEGFeature("Lossless restart interval is not a multiple of samples per row")
         }
