@@ -49,6 +49,7 @@ extension JLIDecoder {
         guard arena.count >= info.arenaByteCount, workspace.count >= info.workspaceByteCount else {
             throw JLIError.decodingFailed("Insufficient RGB arena/workspace capacity")
         }
+        let reconstructionTables = storage.initializeReconstructionTables()
         let frame = parsed.frameInfo, n = frame.width * frame.height
         let hm = frame.components.map(\.horizontalSampling).max() ?? 1
         let vm = frame.components.map(\.verticalSampling).max() ?? 1
@@ -71,7 +72,7 @@ extension JLIDecoder {
         let planes = UnsafeMutableRawBufferPointer(rebasing: arena[..<info.arenaByteCount]).bindMemory(to: Float.self)
         for component in 0..<3 {
             for zigzag in 0..<64 {
-                quant[component * 64 + Quantization.zigzagOrder[zigzag]] = storage.quantizationValue(
+                quant[component * 64 + reconstructionTables.zigzag[zigzag]] = storage.quantizationValue(
                     component: component, zigzag: zigzag, input: encoded)
             }
         }
@@ -147,7 +148,7 @@ extension JLIDecoder {
                         ptrs: ReconstructPtrs(zz: zz + componentOffset, qt: qt + component * 64,
                             px: px, scratch: scratch, plane: plane + component * n),
                         blocksH: scanColumns * bh, compWidth: compWidths[component], compHeight: compHeights[component],
-                        precision: 8, firstBlockRow: row * bv)
+                        precision: 8, firstBlockRow: row * bv, tables: reconstructionTables)
                 }
             }
         }

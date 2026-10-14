@@ -19,25 +19,60 @@ enum AccelerateDSP {
     /// — quantization then nuked everything.)
     static let dctMatrix: [Float] = {
         var matrix = [Float](repeating: 0, count: 64)
+        matrix.withUnsafeMutableBufferPointer { fillDCTMatrix($0) }
+        return matrix
+    }()
+
+    /// Fill admitted caller storage using the same expression order as owned DCT tables.
+    static func fillDCTMatrix(_ matrix: UnsafeMutableBufferPointer<Float>) {
+        precondition(matrix.count == 64)
         for u in 0..<8 {
             let alpha: Float = u == 0 ? 1.0 / sqrt(8.0) : sqrt(2.0 / 8.0)
             for n in 0..<8 {
                 matrix[u * 8 + n] = alpha * cos(Float(2 * n + 1) * Float(u) * .pi / 16.0)
             }
         }
-        return matrix
-    }()
+    }
 
     /// Transposed DCT matrix.
     static let dctMatrixTransposed: [Float] = {
         var transposed = [Float](repeating: 0, count: 64)
-        for i in 0..<8 {
-            for j in 0..<8 {
-                transposed[j * 8 + i] = dctMatrix[i * 8 + j]
-            }
+        dctMatrix.withUnsafeBufferPointer { matrix in
+            transposed.withUnsafeMutableBufferPointer { fillDCTTranspose(matrix, into: $0) }
         }
         return transposed
     }()
+
+    static func fillDCTTranspose(_ matrix: UnsafeBufferPointer<Float>,
+                                 into transposed: UnsafeMutableBufferPointer<Float>) {
+        precondition(matrix.count == 64 && transposed.count == 64)
+        for i in 0..<8 {
+            for j in 0..<8 {
+                transposed[j * 8 + i] = matrix[i * 8 + j]
+            }
+        }
+    }
+
+    /// Synchronous borrowed constants. The caller keeps all four 64-element spans alive.
+    struct ReconstructionTables {
+        let dct: UnsafePointer<Float>
+        let transposedDCT: UnsafePointer<Float>
+        let zigzag: UnsafePointer<Int>
+        let inverseZigzag: UnsafePointer<Int>
+    }
+
+    static func withOwnedReconstructionTables<Result>(_ body: (ReconstructionTables) -> Result) -> Result {
+        dctMatrix.withUnsafeBufferPointer { dct in
+            dctMatrixTransposed.withUnsafeBufferPointer { transposed in
+                Quantization.zigzagOrder.withUnsafeBufferPointer { zigzag in
+                    Quantization.inverseZigzagOrder.withUnsafeBufferPointer { inverse in
+                        body(ReconstructionTables(dct: dct.baseAddress!, transposedDCT: transposed.baseAddress!,
+                            zigzag: zigzag.baseAddress!, inverseZigzag: inverse.baseAddress!))
+                    }
+                }
+            }
+        }
+    }
 
     /// Forward 2D DCT-II on an 8×8 block via `vDSP_mmul`. `F = C · f · Cᵀ`.
     ///
@@ -223,29 +258,39 @@ enum AccelerateDSP {
         blockCount n: Int
     ) {
         guard n > 0 else { return }
+        withOwnedReconstructionTables { tables in
+            inverseDCTBatchDequantized(zigzag: zigzag, quantTable: qt, output: output,
+                scratch: scratch, blockCount: n, tables: tables)
+        }
+    }
+
+    /// Shared numerical kernel for owned and caller-admitted reconstruction tables.
+    static func inverseDCTBatchDequantized(
+        zigzag: UnsafePointer<Int32>, quantTable qt: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>, scratch: UnsafeMutablePointer<Float>,
+        blockCount n: Int, tables: ReconstructionTables
+    ) {
+        guard n > 0 else { return }
         let eightN = vDSP_Length(8 * n)
         let rowStride = 8 * n
 
         // Fused pack: M[r·8N + 8i + c] = dequant(zigzag coefficient at natural
         // position 8r+c) — replaces inverse-zigzag scatter + dequant sweep + pack
         // memcpy with one pass.
-        Quantization.inverseZigzagOrder.withUnsafeBufferPointer { izb in
-            let invZig = izb.baseAddress!
-            for i in 0..<n {
-                let src = zigzag + 64 * i
-                for r in 0..<8 {
-                    let dst = scratch + r * rowStride + 8 * i
-                    let qrow = qt + 8 * r
-                    let zrow = invZig + 8 * r
-                    for c in 0..<8 {
-                        dst[c] = Float(src[zrow[c]]) * qrow[c]
-                    }
+        for i in 0..<n {
+            let src = zigzag + 64 * i
+            for r in 0..<8 {
+                let dst = scratch + r * rowStride + 8 * i
+                let qrow = qt + 8 * r
+                let zrow = tables.inverseZigzag + 8 * r
+                for c in 0..<8 {
+                    dst[c] = Float(src[zrow[c]]) * qrow[c]
                 }
             }
         }
 
         // Pass 1: T = Cᵀ · M (8 × 8N).
-        vDSP_mmul(dctMatrixTransposed, 1, scratch, 1, output, 1, 8, eightN, 8)
+        vDSP_mmul(tables.transposedDCT, 1, scratch, 1, output, 1, 8, eightN, 8)
 
         // Rearrange T → V (8N × 8 per-block-contig).
         for i in 0..<n {
@@ -257,7 +302,7 @@ enum AccelerateDSP {
         }
 
         // Pass 2: f = V · C (8N × 8). Output per-block-contig.
-        vDSP_mmul(scratch, 1, dctMatrix, 1, output, 1, eightN, 8, 8)
+        vDSP_mmul(scratch, 1, tables.dct, 1, output, 1, eightN, 8, 8)
     }
 
     // MARK: - Image-level color conversion (BT.601)

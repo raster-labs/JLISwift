@@ -4,6 +4,44 @@ import Testing
 
 @Suite("Caller-owned baseline RGB storage")
 struct BaselineCallerStorageTests {
+    @Test("Reconstruction constants fit the admitted header, preserve exact values and remain independent")
+    func reconstructionTables() {
+        let size = JLIDecoder.baselineHeaderWorkspaceByteCount
+        let a = UnsafeMutableRawPointer.allocate(byteCount: size + 32, alignment: 16)
+        let b = UnsafeMutableRawPointer.allocate(byteCount: size + 32, alignment: 16)
+        defer { a.deallocate(); b.deallocate() }
+        a.initializeMemory(as: UInt8.self, repeating: 0xAB, count: size + 32)
+        b.initializeMemory(as: UInt8.self, repeating: 0xCD, count: size + 32)
+        let first = JLIBaselineParseStorage(workspace: .init(start: a + 16, count: size))
+        let second = JLIBaselineParseStorage(workspace: .init(start: b + 16, count: size))
+        let t = first.initializeReconstructionTables(), u = second.initializeReconstructionTables()
+        #expect(UnsafeRawPointer(t.dct) - UnsafeRawPointer(a + 16) == 5536)
+        #expect(UnsafeRawPointer(t.transposedDCT) - UnsafeRawPointer(a + 16) == 5792)
+        #expect(UnsafeRawPointer(t.zigzag) - UnsafeRawPointer(a + 16) == 6048)
+        #expect(UnsafeRawPointer(t.inverseZigzag) - UnsafeRawPointer(a + 16) == 6560)
+        for index in 0..<64 {
+            #expect(t.dct[index].bitPattern == AccelerateDSP.dctMatrix[index].bitPattern)
+            #expect(t.transposedDCT[index].bitPattern == AccelerateDSP.dctMatrixTransposed[index].bitPattern)
+            #expect(t.zigzag[index] == Quantization.zigzagOrder[index])
+            #expect(t.inverseZigzag[index] == Quantization.inverseZigzagOrder[index])
+            #expect(t.inverseZigzag[t.zigzag[index]] == index)
+            #expect(t.transposedDCT[(index % 8) * 8 + index / 8] == t.dct[index])
+        }
+        // Mutating one admitted span cannot change another decode or the owned tables.
+        UnsafeMutablePointer(mutating: t.dct)[0] = -999
+        UnsafeMutablePointer(mutating: t.zigzag)[0] = 63
+        #expect(u.dct[0] == AccelerateDSP.dctMatrix[0])
+        #expect(u.zigzag[0] == 0 && Quantization.zigzagOrder[0] == 0)
+        for index in 0..<16 {
+            #expect(a.load(fromByteOffset: index, as: UInt8.self) == 0xAB)
+            #expect(b.load(fromByteOffset: index, as: UInt8.self) == 0xCD)
+        }
+        for offset in (16 + 7072)..<(size + 32) {
+            #expect(a.load(fromByteOffset: offset, as: UInt8.self) == 0xAB)
+            #expect(b.load(fromByteOffset: offset, as: UInt8.self) == 0xCD)
+        }
+    }
+
     private func decode(_ data: [UInt8], configuration: JLIDecoderConfiguration = .default) throws -> [UInt8] {
         try data.withUnsafeBytes { input in
             let header = UnsafeMutableRawPointer.allocate(byteCount: JLIDecoder.baselineHeaderWorkspaceByteCount, alignment: 16)

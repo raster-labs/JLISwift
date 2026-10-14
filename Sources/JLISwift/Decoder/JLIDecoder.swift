@@ -888,13 +888,24 @@ public struct JLIDecoder: Sendable {
         _ blocks: Range<Int>, ptrs: ReconstructPtrs, blocksH: Int,
         compWidth: Int, compHeight: Int, precision: Int, firstBlockRow: Int = 0
     ) {
+        AccelerateDSP.withOwnedReconstructionTables { tables in
+            reconstructBlocks(blocks, ptrs: ptrs, blocksH: blocksH, compWidth: compWidth,
+                compHeight: compHeight, precision: precision, firstBlockRow: firstBlockRow, tables: tables)
+        }
+    }
+
+    internal static func reconstructBlocks(
+        _ blocks: Range<Int>, ptrs: ReconstructPtrs, blocksH: Int,
+        compWidth: Int, compHeight: Int, precision: Int, firstBlockRow: Int = 0,
+        tables: AccelerateDSP.ReconstructionTables
+    ) {
         let m = blocks.count
         guard m > 0 else { return }
         let base = blocks.lowerBound
         let px = ptrs.px + base * 64
         AccelerateDSP.inverseDCTBatchDequantized(
             zigzag: ptrs.zz + base * 64, quantTable: ptrs.qt,
-            output: px, scratch: ptrs.scratch + base * 64, blockCount: m)
+            output: px, scratch: ptrs.scratch + base * 64, blockCount: m, tables: tables)
 
         // Level shift +2^(P-1) + clamp [0, 2^P-1] — 128/255 for 8-bit,
         // 2048/4095 for 12-bit; per-element ops, so chunking changes nothing.

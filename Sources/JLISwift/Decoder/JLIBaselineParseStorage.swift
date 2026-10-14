@@ -11,6 +11,10 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
     private let restartIntervals: UnsafeMutableBufferPointer<Int>
     private let entropyRanges: UnsafeMutableBufferPointer<Range<Int>>
     private let iccRanges: UnsafeMutableBufferPointer<Range<Int>>
+    private let dct: UnsafeMutableBufferPointer<Float>
+    private let transposedDCT: UnsafeMutableBufferPointer<Float>
+    private let zigzag: UnsafeMutableBufferPointer<Int>
+    private let inverseZigzag: UnsafeMutableBufferPointer<Int>
     private(set) var scanCount = 0
     private var seenComponents: UInt8 = 0
     private(set) var adobeTransform: UInt8?
@@ -32,7 +36,26 @@ final class JLIBaselineParseStorage: JPEGParseCapture {
         tables.initialize(repeating: Descriptor()); snapshots.initialize(repeating: Descriptor())
         quantization.initialize(repeating: Descriptor()); entropyRanges.initialize(repeating: 0..<0)
         iccRanges.initialize(repeating: -1..<0)
+        // The existing header reservation admits these spans before parsing. On
+        // supported 64-bit targets, descriptors + constants occupy 7,072 of 16,384 bytes.
+        dct = buffer(Float.self, 64); transposedDCT = buffer(Float.self, 64)
+        zigzag = buffer(Int.self, 64); inverseZigzag = buffer(Int.self, 64)
         precondition(offset <= Self.byteCount)
+    }
+
+    /// Called only after full decode capacity admission. These pointers remain
+    /// synchronous borrows of the header workspace; no table escapes in the result.
+    func initializeReconstructionTables() -> AccelerateDSP.ReconstructionTables {
+        AccelerateDSP.fillDCTMatrix(dct)
+        AccelerateDSP.fillDCTTranspose(UnsafeBufferPointer(dct), into: transposedDCT)
+        Quantization.fillZigzagOrder(zigzag)
+        Quantization.fillInverseZigzagOrder(UnsafeBufferPointer(zigzag), into: inverseZigzag)
+        guard let dctBase = dct.baseAddress, let transposedBase = transposedDCT.baseAddress,
+              let zigzagBase = zigzag.baseAddress, let inverseBase = inverseZigzag.baseAddress else {
+            preconditionFailure("Validated reconstruction table storage has no backing")
+        }
+        return AccelerateDSP.ReconstructionTables(dct: dctBase, transposedDCT: transposedBase,
+            zigzag: zigzagBase, inverseZigzag: inverseBase)
     }
     func table(isDC: Bool, id: Int, bits: Int, values: Int, count: Int) {
         tables[(isDC ? 0 : 16) + id] = Descriptor(bits: bits, values: values, count: count)
